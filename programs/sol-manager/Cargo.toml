@@ -1,0 +1,24 @@
+[package]
+name = "sol-manager"
+version = "0.1.0"
+description = "Created with Anchor"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "sol_manager"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+solana-program = "1.16.0" # needed for struct Ed25519SignatureOffsets
+anchor-lang = "0.29.0"
+anchor-spl = "0.29.0"
+bs58 = "0.3"
+bytemuck = "1.19.0"
