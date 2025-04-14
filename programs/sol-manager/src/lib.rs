@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)]
+
 mod ed25519;
 
 use anchor_lang::{prelude::*, system_program};
@@ -5,8 +7,8 @@ use anchor_lang::system_program::{transfer, Transfer};
 use anchor_lang::solana_program::sysvar::rent::Rent;
 use anchor_spl::associated_token::{self, AssociatedToken};
 use anchor_spl::token::{self, Mint, Token, TokenAccount};
-use solana_program::sysvar::instructions::{load_current_index_checked, load_instruction_at_checked};
-use solana_program::program_error::ProgramError;
+use anchor_lang::solana_program::sysvar::instructions::{load_current_index_checked, load_instruction_at_checked};
+use anchor_lang::solana_program::program_error::ProgramError;
 use bs58;
 
 const MIN_DEPOSIT_LAMPORTS: u64 = 1_000_000;
@@ -14,7 +16,7 @@ const ASSETMAN_CONFIG_SEEDS: &[u8] = b"assetman-configs";
 const MAIN_VAULTS_SEED: &[u8] = b"main-vault";
 const USER_VAULTS_SEED: &[u8] = b"user-vault";
 
-declare_id!("Gr4CykSFMDyVPj8nwtfsftd8fp3YkWqRniCv5GKvqWRv");
+declare_id!("FdHzkmeyEosHXxrTvuaeCBvv5Ne97BnHGn3rCmTB9ZXQ");
 
 fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64) -> Vec<u8> {
     let base58_address = bs58::encode(public_key.to_bytes()).into_string();
