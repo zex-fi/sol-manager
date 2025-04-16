@@ -18,9 +18,12 @@ const USER_VAULTS_SEED: &[u8] = b"user-vault";
 
 declare_id!("FdHzkmeyEosHXxrTvuaeCBvv5Ne97BnHGn3rCmTB9ZXQ");
 
-fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64) -> Vec<u8> {
+fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, nonce: u64) -> Vec<u8> {
     let base58_address = bs58::encode(public_key.to_bytes()).into_string();
-    let formatted_string = format!("allowed withdraw {} {} to address {}", amount, token, base58_address);
+    let formatted_string = format!(
+        "allowed withdraw {} {} to address {} with nonce {}",
+        amount, token, base58_address, nonce
+    );
     formatted_string.as_bytes().to_vec()
 }
 
@@ -64,9 +67,7 @@ pub mod zex_asset_manager {
 
     pub fn transfer_sol_to_main_vault(
         ctx: Context<TransferSolToMainVault>,
-        agent: [u8; 32],
-        account: u64,
-        user: u64
+        salt: u64
     ) -> Result<()> {
         let vault = &ctx.accounts.user_vault;
         let vault_lamports = **vault.lamports.borrow();
@@ -75,9 +76,7 @@ pub mod zex_asset_manager {
         let bump_seed = ctx.bumps.user_vault;
         let signer_seeds: &[&[&[u8]]] = &[&[
             USER_VAULTS_SEED,
-            &agent,
-            &account.to_be_bytes(),
-            &user.to_be_bytes(),
+            &salt.to_be_bytes(),
             &[bump_seed]
         ]];
 
@@ -97,16 +96,27 @@ pub mod zex_asset_manager {
     pub fn withdraw_sol(
         ctx: Context<WithdrawSol>,
         amount: u64,
-        signature: [u8; 64]
+        nonce: u64,
+        signature: [u8; 64],
     ) -> Result<()> {
         let assetman = &ctx.accounts.configs;
+
+        // Check instruction index
         let index = load_current_index_checked(&ctx.accounts.instructions.to_account_info())?;
         require!(index >= 1, CustomError::VerifyFirst);
 
-        let message = get_withdraw_message("SOL", &ctx.accounts.destination.key(), amount);
+        // Verify signature (message includes nonce)
+        let message = get_withdraw_message("SOL", &ctx.accounts.destination.key(), amount, nonce);
         let ix = load_instruction_at_checked(index as usize - 1, &ctx.accounts.instructions.to_account_info())?;
         ed25519::verify(&ix, &signature, &message, &assetman.withdraw_author.to_bytes())?;
 
+        // Check if nonce already used
+        require!(!ctx.accounts.nonce_record.used, CustomError::Unauthorized);
+
+        // Mark nonce as used
+        ctx.accounts.nonce_record.used = true;
+
+        // Transfer SOL (rent-aware)
         let vault = &ctx.accounts.main_vault;
         let vault_lamports = **vault.lamports.borrow();
         let rent_exempt_minimum = Rent::get()?.minimum_balance(vault.data_len());
@@ -129,11 +139,10 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+
     pub fn transfer_spl_to_main_vault(
         ctx: Context<TransferSplToMainVault>,
-        agent: [u8; 32],
-        account: u64,
-        user: u64
+        salt: u64
     ) -> Result<()> {
         let user_token_account = &ctx.accounts.user_token_account;
         let amount = user_token_account.amount;
@@ -141,9 +150,7 @@ pub mod zex_asset_manager {
         let bump_seed = ctx.bumps.user_vault;
         let signer_seeds: &[&[&[u8]]] = &[&[
             USER_VAULTS_SEED,
-            &agent,
-            &account.to_be_bytes(),
-            &user.to_be_bytes(),
+            &salt.to_be_bytes(),
             &[bump_seed]
         ]];
 
@@ -155,26 +162,40 @@ pub mod zex_asset_manager {
     pub fn withdraw_spl(
         ctx: Context<WithdrawSpl>,
         amount: u64,
+        nonce: u64,
         signature: [u8; 64],
     ) -> Result<()> {
         let assetman = &ctx.accounts.configs;
+
+        // Load instruction index for replay protection
         let index = load_current_index_checked(&ctx.accounts.instructions.to_account_info())?;
         require!(index >= 1, CustomError::VerifyFirst);
 
+        // Build message with nonce included
         let message = get_withdraw_message(
             &ctx.accounts.mint.key().to_string(),
             &ctx.accounts.destination.key(),
-            amount
+            amount,
+            nonce,
         );
 
+        // Load prior ed25519 instruction
         let ix = load_instruction_at_checked(index as usize - 1, &ctx.accounts.instructions.to_account_info())?;
         ed25519::verify(&ix, &signature, &message, &assetman.withdraw_author.to_bytes())?;
 
+        // Nonce check
+        require!(!ctx.accounts.nonce_record.used, CustomError::Unauthorized);
+        ctx.accounts.nonce_record.used = true;
+
+        // Token transfer pre-checks
         ctx.accounts.ensure_account_exist()?;
         ctx.accounts.ensure_sufficient_balance(amount)?;
+
+        // Do the token transfer
         token::transfer(ctx.accounts.into_transfer_context(), amount)?;
         Ok(())
     }
+
 }
 
 // Define the Configs account
@@ -236,9 +257,9 @@ pub struct SetWithdrawAuthority<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(agent: [u8; 32], account: u64, user: u64)]
+#[instruction(salt: u64)]
 pub struct TransferSolToMainVault<'info> {
-    #[account(mut, seeds = [USER_VAULTS_SEED, &agent, &account.to_be_bytes(), &user.to_be_bytes()], bump)]
+    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_be_bytes()], bump)]
     pub user_vault: AccountInfo<'info>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
@@ -248,6 +269,7 @@ pub struct TransferSolToMainVault<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(nonce: u64)]
 pub struct WithdrawSol<'info> {
     #[account(seeds = [ASSETMAN_CONFIG_SEEDS], bump)]
     pub configs: Account<'info, Configs>,
@@ -260,16 +282,25 @@ pub struct WithdrawSol<'info> {
 
     pub instructions: UncheckedAccount<'info>,
 
+    /// CHECK: PDA nonce record, checked in code
+    #[account(
+        mut,
+        seeds = [b"nonce", destination.key().as_ref(), &nonce.to_be_bytes()],
+        bump,
+        close = destination
+    )]
+    pub nonce_record: Account<'info, NonceRecord>,
+
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(agent: [u8; 32], account: u64, user: u64)]
+#[instruction(salt: u64)]
 pub struct TransferSplToMainVault<'info> {
     #[account(signer)]
     pub signer: AccountInfo<'info>,
 
-    #[account(mut, seeds = [USER_VAULTS_SEED, &agent, &account.to_be_bytes(), &user.to_be_bytes()], bump)]
+    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_be_bytes()], bump)]
     pub user_vault: AccountInfo<'info>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
@@ -336,6 +367,7 @@ impl<'info> TransferSplToMainVault<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(nonce: u64)]
 pub struct WithdrawSpl<'info> {
     #[account(signer)]
     pub signer: AccountInfo<'info>,
@@ -358,6 +390,14 @@ pub struct WithdrawSpl<'info> {
     pub mint: Account<'info, Mint>,
 
     pub instructions: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [b"nonce", destination.key().as_ref(), &nonce.to_be_bytes()],
+        bump,
+        close = destination
+    )]
+    pub nonce_record: Account<'info, NonceRecord>,
 
     #[account(address = system_program::ID)]
     pub system_program: Program<'info, System>,
@@ -414,6 +454,12 @@ impl<'info> WithdrawSpl<'info> {
         };
         CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
     }
+}
+
+#[account]
+#[derive(Default)]
+pub struct NonceRecord {
+    pub used: bool,
 }
 
 // Define custom errors
