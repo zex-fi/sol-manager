@@ -69,9 +69,6 @@ pub mod zex_asset_manager {
         ctx: Context<TransferSolToMainVault>,
         salt: u64,
     ) -> Result<()> {
-        msg!("hi");
-        msg!("salt: {}", salt);
-
         let vault = &ctx.accounts.user_vault;
         let vault_lamports = **vault.lamports.borrow();
         require!(vault_lamports > MIN_DEPOSIT_LAMPORTS, CustomError::InsufficientFunds);
@@ -102,7 +99,6 @@ pub mod zex_asset_manager {
         withdraw_id: u64,
         signature: [u8; 64],
     ) -> Result<()> {
-        msg!("inner hi bitch");
         let assetman = &ctx.accounts.configs;
 
         // Check instruction index
