@@ -114,3 +114,9 @@ The Anchor Program Registry is a decentralized registry where you can publish yo
 
 [registry]
 url = "https://api.apr.dev"
+
+
+## Reset localnet
+```
+solana-test-validator --reset
+```

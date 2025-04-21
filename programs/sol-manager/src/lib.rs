@@ -67,8 +67,11 @@ pub mod zex_asset_manager {
 
     pub fn transfer_sol_to_main_vault(
         ctx: Context<TransferSolToMainVault>,
-        salt: u64
+        salt: u64,
     ) -> Result<()> {
+        msg!("hi");
+        msg!("salt: {}", salt);
+
         let vault = &ctx.accounts.user_vault;
         let vault_lamports = **vault.lamports.borrow();
         require!(vault_lamports > MIN_DEPOSIT_LAMPORTS, CustomError::InsufficientFunds);
@@ -76,7 +79,7 @@ pub mod zex_asset_manager {
         let bump_seed = ctx.bumps.user_vault;
         let signer_seeds: &[&[&[u8]]] = &[&[
             USER_VAULTS_SEED,
-            &salt.to_be_bytes(),
+            &salt.to_le_bytes(),
             &[bump_seed]
         ]];
 
@@ -99,6 +102,7 @@ pub mod zex_asset_manager {
         withdraw_id: u64,
         signature: [u8; 64],
     ) -> Result<()> {
+        msg!("inner hi bitch");
         let assetman = &ctx.accounts.configs;
 
         // Check instruction index
@@ -150,7 +154,7 @@ pub mod zex_asset_manager {
         let bump_seed = ctx.bumps.user_vault;
         let signer_seeds: &[&[&[u8]]] = &[&[
             USER_VAULTS_SEED,
-            &salt.to_be_bytes(),
+            &salt.to_le_bytes(),
             &[bump_seed]
         ]];
 
@@ -274,7 +278,7 @@ pub struct SetWithdrawAuthority<'info> {
 #[derive(Accounts)]
 #[instruction(salt: u64)]
 pub struct TransferSolToMainVault<'info> {
-    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_be_bytes()], bump)]
+    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_le_bytes()], bump)]
     pub user_vault: AccountInfo<'info>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
@@ -300,7 +304,7 @@ pub struct WithdrawSol<'info> {
     /// CHECK: PDA withdraw_id record, checked in code
     #[account(
         mut,
-        seeds = [b"withdraw_id", destination.key().as_ref(), &withdraw_id.to_be_bytes()],
+        seeds = [b"withdraw_id", destination.key().as_ref(), &withdraw_id.to_le_bytes()],
         bump,
         close = destination
     )]
@@ -315,7 +319,7 @@ pub struct TransferSplToMainVault<'info> {
     #[account(signer)]
     pub signer: AccountInfo<'info>,
 
-    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_be_bytes()], bump)]
+    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_le_bytes()], bump)]
     pub user_vault: AccountInfo<'info>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
@@ -408,7 +412,7 @@ pub struct WithdrawSpl<'info> {
 
     #[account(
         mut,
-        seeds = [b"withdraw_id", destination.key().as_ref(), &withdraw_id.to_be_bytes()],
+        seeds = [b"withdraw_id", destination.key().as_ref(), &withdraw_id.to_le_bytes()],
         bump,
         close = destination
     )]

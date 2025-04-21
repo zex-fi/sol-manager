@@ -19,8 +19,8 @@ sol_manager = "FdHzkmeyEosHXxrTvuaeCBvv5Ne97BnHGn3rCmTB9ZXQ"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "https://api.devnet.solana.com"
-#cluster = "localnet"
+#cluster = "https://api.devnet.solana.com"
+cluster = "localnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]
