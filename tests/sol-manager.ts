@@ -2,7 +2,7 @@ import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { ZexAssetManager } from "../target/types/zex_asset_manager";
 import assert from "assert";
-import { Keypair, PublicKey, SendTransactionError, SystemProgram, TransactionInstruction } from "@solana/web3.js";
+import { Keypair, PublicKey, SendTransactionError, SystemProgram, TransactionInstruction, Ed25519Program, AccountMeta } from "@solana/web3.js";
 import * as fs from "fs";
 import bs58 from "bs58";
 import * as crypto from "crypto";
@@ -11,6 +11,8 @@ import * as crypto from "crypto";
 const ASSETMAN_CONFIG_SEEDS = Buffer.from("assetman-configs"); // Updated seed
 const MAIN_VAULTS_SEED = Buffer.from("main-vault");
 const USER_VAULTS_SEED = Buffer.from("user-vault");
+const WITHDRAW_ID_SEED = Buffer.from("withdraw-id");
+
 
 
 describe("zex-asset-manager", () => {
@@ -117,24 +119,6 @@ describe("zex-asset-manager", () => {
 
     });
 
-    it("Sets withdraw authority", async () => {
-      const newWithdrawAuthority = anchor.web3.Keypair.generate().publicKey;
-
-      const tx = await program.methods
-          .setWithdrawAuthority(newWithdrawAuthority)
-          .accounts({
-            admin: admin.publicKey,
-          })
-          .signers([admin])
-          .rpc();
-
-      console.log("Set withdraw authority transaction signature:", tx);
-
-      // Fetch the new withdraw authority and verify it's updated
-      const config = await program.account.configs.fetch(configs_publicKey);
-      assert.strictEqual(config.withdrawAuthor.toString(), newWithdrawAuthority.toString(), "Withdraw authority was not updated");
-    });
-
     it("Transfers SOL to vault", async () => {
         console.log("program id", program.programId); //FdHzkmeyEosHXxrTvuaeCBvv5Ne97BnHGn3rCmTB9ZXQ
         let user_public_key : PublicKey;
@@ -196,27 +180,37 @@ describe("zex-asset-manager", () => {
 
     it("Withdraw From Vault", async () => {
         const destination = anchor.web3.Keypair.generate().publicKey;
-        const withdrawId = new anchor.BN(2);
+        const withdrawId = new anchor.BN(6);
         const withdrawIdByte = withdrawId.toArrayLike(Buffer, "le", 8);
-        const amount = new anchor.BN(1000000);
+
+        const amount_val = 100000000;
+        const amount = new anchor.BN(amount_val);
 
         let withdrawIdRecordPDA: PublicKey;
 
-        [withdrawIdRecordPDA] = PublicKey.findProgramAddressSync(
-            [
-                Buffer.from("withdraw_id"),
-                destination.toBuffer(),
-                withdrawIdByte,
-            ],
+        [withdrawIdRecordPDA, ] = PublicKey.findProgramAddressSync(
+            [WITHDRAW_ID_SEED, withdrawIdByte,],
             program.programId
         );
 
         // Create the WithdrawIDRecord account (rent exempt)
         const sig1 = await provider.connection.requestAirdrop(
             destination,
-            5 * anchor.web3.LAMPORTS_PER_SOL
+            2 * anchor.web3.LAMPORTS_PER_SOL
         );
         await provider.connection.confirmTransaction(sig1);
+
+        const sig2 = await provider.connection.requestAirdrop(
+            vault_publicKey,
+            10 * anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig2);
+
+        const sig3 = await provider.connection.requestAirdrop(
+            admin.publicKey,
+            10 * anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig3);
 
         // Build message as defined in your program
         const base58Dest = bs58.encode(destination.toBytes());
@@ -240,66 +234,65 @@ describe("zex-asset-manager", () => {
         const signature = crypto.sign(null, message, keyObject);
 
         // Create Ed25519 instruction
-        const ed25519Ix = new TransactionInstruction({
-            programId: new PublicKey("Ed25519SigVerify111111111111111111111111111"),
-            keys: [],
-            data: (() => {
-                const publicKey = admin.publicKey.toBytes();
 
-                const data = Buffer.alloc(
-                    1 + // signature count
-                    1 + // padding
-                    32 + // public key
-                    1 + // padding
-                    2 + // sig length
-                    64 + // sig
-                    2 + // msg length
-                    message.length // msg
-                );
-
-                let offset = 0;
-                data[offset++] = 1; // sig count
-                data[offset++] = 0; // padding
-                Buffer.from(publicKey).copy(data, offset);
-                offset += 32;
-                data[offset++] = 0; // padding
-                data.writeUInt16LE(64, offset);
-                offset += 2;
-                Buffer.from(signature).copy(data, offset);
-                offset += 64;
-                data.writeUInt16LE(message.length, offset);
-                offset += 2;
-                Buffer.from(message).copy(data, offset);
-
-                return data;
-            })(),
-        });
+        const ed25519Ix = Ed25519Program.createInstructionWithPublicKey({
+            signature: signature,
+            message: message,
+            publicKey: admin.publicKey.toBytes()
+        })
+        const initialVaultBalance = await provider.connection.getBalance(destination);
 
         // Build program instruction
+        console.log("withdrawIdRecordPDA:", withdrawIdRecordPDA)
+        console.log("main vault", vault_publicKey);
+        console.log("destination", destination);
         const programIx = await program.methods
-            .withdrawSol(amount, withdrawId, Array.from(signature))
+            .withdrawSol(amount, withdrawId, signature)
             .accounts({
                 configs: configs_publicKey,
-                main_vault: vault_publicKey,
+                mainVault: vault_publicKey,
                 destination: destination,
                 instructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
-                withdraw_id_record: withdrawIdRecordPDA,
-                system_program: SystemProgram.programId,
+                withdrawIdRecord: withdrawIdRecordPDA,
+                systemProgram: SystemProgram.programId,
             })
+            .signers([admin])
             .instruction();
         const tx = new anchor.web3.Transaction();
         tx.add(ed25519Ix);
         tx.add(programIx);
 
-        try {
-            const sig = await provider.sendAndConfirm(tx);
-            console.log("✅ Transaction Signature:", sig);
-        } catch (e) {
-            console.log(await e.getLogs())
-            console.log('//////')
-            const logs = e.logs ?? (await (e as any).simulationResponse.value.logs);
-            console.error("Transaction failed logs:\n", logs.join("\n"));
-            throw e;
-        }
+        const sig = await provider.sendAndConfirm(tx);
+        console.log("✅ Transaction Signature:", sig);
+
+        const finalVaultBalance = await provider.connection.getBalance(destination);
+
+        console.log("initialVaultBalance:", initialVaultBalance);
+        console.log("finalVaultBalance:", finalVaultBalance);
+
+        assert.strictEqual(
+              finalVaultBalance,
+              initialVaultBalance + amount_val,
+              "Vault balance should increase by transferred amount"
+            );
+    });
+
+
+    it("Sets withdraw authority", async () => {
+        const newWithdrawAuthority = anchor.web3.Keypair.generate().publicKey;
+
+        const tx = await program.methods
+            .setWithdrawAuthority(newWithdrawAuthority)
+            .accounts({
+                admin: admin.publicKey,
+            })
+            .signers([admin])
+            .rpc();
+
+        console.log("Set withdraw authority transaction signature:", tx);
+
+        // Fetch the new withdraw authority and verify it's updated
+        const config = await program.account.configs.fetch(configs_publicKey);
+        assert.strictEqual(config.withdrawAuthor.toString(), newWithdrawAuthority.toString(), "Withdraw authority was not updated");
     });
 });

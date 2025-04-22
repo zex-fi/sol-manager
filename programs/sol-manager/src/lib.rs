@@ -15,6 +15,7 @@ const MIN_DEPOSIT_LAMPORTS: u64 = 1_000_000;
 const ASSETMAN_CONFIG_SEEDS: &[u8] = b"assetman-configs";
 const MAIN_VAULTS_SEED: &[u8] = b"main-vault";
 const USER_VAULTS_SEED: &[u8] = b"user-vault";
+const WITHDRAW_ID_SEED: &[u8] = b"withdraw-id";
 
 declare_id!("FdHzkmeyEosHXxrTvuaeCBvv5Ne97BnHGn3rCmTB9ZXQ");
 
@@ -284,27 +285,31 @@ pub struct TransferSolToMainVault<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(withdraw_id: u64)]
+#[instruction(amount:u64, withdraw_id: u64, signature: [u8; 64])]
 pub struct WithdrawSol<'info> {
     #[account(seeds = [ASSETMAN_CONFIG_SEEDS], bump)]
     pub configs: Account<'info, Configs>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
-    pub main_vault: AccountInfo<'info>,
+    pub main_vault: SystemAccount<'info>,
 
     #[account(mut)]
-    pub destination: AccountInfo<'info>,
+    pub destination: SystemAccount<'info>,
 
     pub instructions: UncheckedAccount<'info>,
 
     /// CHECK: PDA withdraw_id record, checked in code
     #[account(
-        mut,
-        seeds = [b"withdraw_id", destination.key().as_ref(), &withdraw_id.to_le_bytes()],
+        init,
+        payer = signer,
+        space = 8 + 1,
+        seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
         bump,
-        close = destination
     )]
     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
+
+    #[account(mut, signer)]
+    pub signer: AccountInfo<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -382,9 +387,9 @@ impl<'info> TransferSplToMainVault<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(withdraw_id: u64)]  // todo :: rename to withdraw_id
+#[instruction(withdraw_id: u64)]
 pub struct WithdrawSpl<'info> {
-    #[account(signer)]
+    #[account(mut, signer)]
     pub signer: AccountInfo<'info>,
 
     #[account(seeds = [ASSETMAN_CONFIG_SEEDS], bump)]
@@ -407,10 +412,11 @@ pub struct WithdrawSpl<'info> {
     pub instructions: UncheckedAccount<'info>,
 
     #[account(
-        mut,
-        seeds = [b"withdraw_id", destination.key().as_ref(), &withdraw_id.to_le_bytes()],
+        init,
+        payer = signer,
+        space =  8 + 1,
+        seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
         bump,
-        close = destination
     )]
     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
 
@@ -483,11 +489,9 @@ pub struct ResetWithdrawSplId<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
 
-    pub destination: AccountInfo<'info>,
-
     #[account(
         mut,
-        seeds = [b"withdraw", destination.key().as_ref(), &withdraw_id.to_le_bytes()],
+        seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
         bump,
     )]
     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
@@ -500,11 +504,9 @@ pub struct ResetWithdrawSolId<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
 
-    pub destination: AccountInfo<'info>,
-
     #[account(
         mut,
-        seeds = [b"withdraw", destination.key().as_ref(), &withdraw_id.to_le_bytes()],
+        seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
         bump,
     )]
     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
