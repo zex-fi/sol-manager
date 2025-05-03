@@ -17,7 +17,7 @@ const MAIN_VAULTS_SEED: &[u8] = b"main-vault";
 const USER_VAULTS_SEED: &[u8] = b"user-vault";
 const WITHDRAW_ID_SEED: &[u8] = b"withdraw-id";
 
-declare_id!("FdHzkmeyEosHXxrTvuaeCBvv5Ne97BnHGn3rCmTB9ZXQ");
+declare_id!("CVtFHhvpcXSxAhcmkwtSozQogJonYMZoC9m4BjB1pm3u");
 
 fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, withdraw_id: u64) -> Vec<u8> {
     let base58_address = bs58::encode(public_key.to_bytes()).into_string();
@@ -299,8 +299,9 @@ pub struct WithdrawSol<'info> {
     pub instructions: UncheckedAccount<'info>,
 
     /// CHECK: PDA withdraw_id record, checked in code
+    /// init_if_needed change to init in mainnet
     #[account(
-        init,
+        init_if_needed,
         payer = signer,
         space = 8 + 1,
         seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
@@ -410,9 +411,10 @@ pub struct WithdrawSpl<'info> {
     pub mint: Account<'info, Mint>,
 
     pub instructions: UncheckedAccount<'info>,
-
+    
+    /// init_if_needed change to init in mainnet
     #[account(
-        init,
+        init_if_needed,
         payer = signer,
         space =  8 + 1,
         seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
@@ -495,6 +497,8 @@ pub struct ResetWithdrawSplId<'info> {
         bump,
     )]
     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
+
+    pub system_program: Program<'info, System>,
 }
 
 
@@ -510,6 +514,8 @@ pub struct ResetWithdrawSolId<'info> {
         bump,
     )]
     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
+
+    pub system_program: Program<'info, System>,
 }
 
 
