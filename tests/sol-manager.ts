@@ -1,11 +1,20 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
-import { ZexAssetManager } from "../target/types/zex_asset_manager";
+import {Program} from "@coral-xyz/anchor";
+import {ZexAssetManager} from "../target/types/zex_asset_manager";
 import assert from "assert";
-import { Keypair, PublicKey, SendTransactionError, SystemProgram, TransactionInstruction, Ed25519Program, AccountMeta } from "@solana/web3.js";
+import {Ed25519Program, PublicKey, SystemProgram} from "@solana/web3.js";
 import * as fs from "fs";
 import bs58 from "bs58";
 import * as crypto from "crypto";
+import {
+    createMint,
+    getAssociatedTokenAddressSync,
+    getOrCreateAssociatedTokenAccount,
+    mintTo,
+    TOKEN_PROGRAM_ID,
+    transfer
+} from '@solana/spl-token';
+import {ASSOCIATED_PROGRAM_ID} from '@coral-xyz/anchor/dist/cjs/utils/token';
 
 
 const ASSETMAN_CONFIG_SEEDS = Buffer.from("assetman-configs"); // Updated seed
@@ -29,7 +38,7 @@ describe("zex-asset-manager", () => {
     // const secret = JSON.parse(fs.readFileSync("admin.json", "utf-8"));
     // let admin = anchor.web3.Keypair.fromSecretKey(Uint8Array.from(secret));
 
-    console.log(admin.publicKey)
+    console.log("admin", admin.publicKey.toBase58());
 
     let configs_publicKey: PublicKey;
     let vault_publicKey: PublicKey;
@@ -44,12 +53,87 @@ describe("zex-asset-manager", () => {
         program.programId
     );
 
-    beforeEach(async () => {
+
+    const DECIMALS = 2;
+    async function createTokenMint(authority: PublicKey): Promise<PublicKey> {
+        const mint = await createMint(
+            provider.connection,
+            // @ts-ignore
+            admin,
+            authority,
+            null,
+            DECIMALS // Decimal places for the token
+        );
+        return mint;
+    }
+
+    async function mintTokens(mint: PublicKey, owner: PublicKey, amount: number) {
+        const destination = await getOrCreateAssociatedTokenAccount(
+            provider.connection,
+            // @ts-ignore
+            admin,
+            mint,
+            owner,
+        )
+
+        return await mintTo(
+            provider.connection,
+            // @ts-ignore
+            admin,
+            mint,
+            destination.address,
+            // @ts-ignore
+            admin,
+            amount
+        );
+    }
+    // Function to create an associated token account
+    async function createAssociatedTokenAccount(mint: PublicKey, owner: PublicKey, allowOwnerOffCurve?: boolean): Promise<PublicKey> {
+        const account = await getOrCreateAssociatedTokenAccount(
+            provider.connection,
+            // @ts-ignore
+            admin,
+            mint,
+            owner,
+            allowOwnerOffCurve,
+        );
+        return account.address;
+    }
+
+    async function transferToken(mint: PublicKey, from: PublicKey, to: PublicKey, amount: number) {
+        const fromTokenAccount = getAssociatedTokenAddressSync(mint, from, true)
+        const toTokenAccount = await createAssociatedTokenAccount(mint, to, true)
+        return await transfer(
+            provider.connection,
+            admin,
+            fromTokenAccount,
+            toTokenAccount,
+            from,
+            amount
+        )
+    }
+
+    async function request_airdrop_to_admin() {
         const sig = await provider.connection.requestAirdrop(
             admin.publicKey,
             5 * anchor.web3.LAMPORTS_PER_SOL
         );
         await provider.connection.confirmTransaction(sig);
+    }
+
+    let mint : PublicKey;
+
+    before(async () => {
+        await request_airdrop_to_admin();
+
+        mint = await createTokenMint(admin.publicKey);
+
+        const mintAmount = 2000;
+        await mintTokens(mint, admin.publicKey, mintAmount);
+    })
+
+    beforeEach(async () => {
+        await request_airdrop_to_admin();
     });
 
     console.log("Initializing");
@@ -178,6 +262,55 @@ describe("zex-asset-manager", () => {
         );
     });
 
+    it("Transfers SPL to vault", async () => {
+        console.log("program id", program.programId);
+        let user_vault : PublicKey;
+
+        const user_salt = new anchor.BN(5);
+        const salt_bytes = user_salt.toBuffer("le", 8);
+
+        [user_vault, ] = anchor.web3.PublicKey.findProgramAddressSync(
+            [USER_VAULTS_SEED, salt_bytes],
+            program.programId
+        );
+
+        const user_token_account = getAssociatedTokenAddressSync(mint, user_vault, true);;
+        const main_vault_token_account = getAssociatedTokenAddressSync(mint, vault_publicKey, true);;
+
+        console.log("User vault PDA:", user_vault.toBase58());
+        console.log("Vault publicKey:", vault_publicKey.toBase58());
+        console.log("User token account:", user_token_account.toBase58());
+        console.log("Main vault token account:", main_vault_token_account.toBase58());
+
+        const token_amount = 1000;
+        await transferToken(mint, admin.publicKey, user_vault, token_amount);
+
+        const txSig = await program.methods
+            .transferSplToMainVault(user_salt)
+            .accounts({
+                userVault: user_vault,
+                vaultPublicKey: vault_publicKey,
+                userTokenAccount: user_token_account,
+                mainVaultTokenAccount: main_vault_token_account,
+                mint: mint,
+                tokenProgram: TOKEN_PROGRAM_ID,
+                associatedTokenProgram: ASSOCIATED_PROGRAM_ID
+            })
+            .rpc();
+
+        console.log("Tx Signature:", txSig);
+
+        const main_vault_token_balance = await provider.connection.getTokenAccountBalance(main_vault_token_account);
+        console.log("Main vault token balance after:", main_vault_token_balance.value.amount);
+
+
+        assert.strictEqual(
+            token_amount.toString(),
+            main_vault_token_balance.value.amount,
+            "Vault balance should increase by transferred amount"
+        );
+    });
+
     it("Withdraw From Vault", async () => {
         const destination = anchor.web3.Keypair.generate().publicKey;
         const withdrawId = new anchor.BN(6);
@@ -271,12 +404,101 @@ describe("zex-asset-manager", () => {
         console.log("finalVaultBalance:", finalVaultBalance);
 
         assert.strictEqual(
-              finalVaultBalance,
-              initialVaultBalance + amount_val,
+            finalVaultBalance,
+            initialVaultBalance + amount_val,
+            "Vault balance should increase by transferred amount"
+        );
+    });
+
+
+    it("Withdraw SPL From Vault", async () => {
+        const destination = anchor.web3.Keypair.generate().publicKey;
+        console.log("📍 Destination address:", destination.toBase58());
+
+        const withdrawId = new anchor.BN(7);
+        const withdrawIdByte = withdrawId.toArrayLike(Buffer, "le", 8);
+
+        const amount_val = 1000;
+        const amount = new anchor.BN(amount_val);
+
+        await transferToken(mint, admin.publicKey, vault_publicKey, amount_val);
+
+        let withdrawIdRecordPDA: PublicKey;
+
+        [withdrawIdRecordPDA, ] = PublicKey.findProgramAddressSync(
+            [WITHDRAW_ID_SEED, withdrawIdByte],
+            program.programId
+        );
+        console.log("📍 withdrawIdRecord PDA:", withdrawIdRecordPDA.toBase58());
+
+        const destination_token_account = getAssociatedTokenAddressSync(mint, destination, true);;
+        const main_vault_token_account = getAssociatedTokenAddressSync(mint, vault_publicKey, true);;
+        console.log("📍 Main vault token account:", main_vault_token_account.toBase58());
+        console.log("📍 Destination token account:", destination_token_account.toBase58());
+
+
+        // Build message as defined in your program
+        const base58Dest = bs58.encode(destination.toBytes());
+        const message = Buffer.from(
+            `allowed withdraw ${amount.toString()} ${mint.toString()} to address ${base58Dest} with withdraw_id ${withdrawId.toString()}`
+        );
+
+        // Sign message using Solana Keypair
+        const privateKeyRaw = admin.secretKey.slice(0, 32); // Only first 32 bytes needed
+        const keyObject = crypto.createPrivateKey({
+            key: Buffer.concat([
+                Buffer.from([
+                    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
+                    0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+                ]),
+                privateKeyRaw,
+            ]),
+            format: "der",
+            type: "pkcs8",
+        });
+        const signature = crypto.sign(null, message, keyObject);
+
+        // Create Ed25519 instruction
+
+        const ed25519Ix = Ed25519Program.createInstructionWithPublicKey({
+            signature: signature,
+            message: message,
+            publicKey: admin.publicKey.toBytes()
+        })
+
+        const programIx = await program.methods
+            .withdrawSpl(amount, withdrawId, signature)
+            .accounts({
+                configs: configs_publicKey,
+                main_vault: vault_publicKey,
+                mainVaultTokenAccount: main_vault_token_account,
+                destination: destination,
+                destinationTokenAccount: destination_token_account,
+                mint: mint,
+                instructions: anchor.web3.SYSVAR_INSTRUCTIONS_PUBKEY,
+                tokenProgram: TOKEN_PROGRAM_ID,
+                associatedTokenProgram: ASSOCIATED_PROGRAM_ID,
+                withdraw_id_record: withdrawIdRecordPDA,
+            })
+            .signers([admin])
+            .instruction();
+
+        const tx = new anchor.web3.Transaction();
+        tx.add(ed25519Ix);
+        tx.add(programIx);
+
+        const sig = await provider.sendAndConfirm(tx);
+        console.log("✅ Transaction Signature:", sig);
+
+        const finalVaultBalance = await provider.connection.getTokenAccountBalance(destination_token_account);
+        console.log("finalVaultBalance:", finalVaultBalance.value.amount);
+
+        assert.strictEqual(
+              amount_val.toString(),
+              finalVaultBalance.value.amount,
               "Vault balance should increase by transferred amount"
             );
     });
-
 
     it("Sets withdraw authority", async () => {
         const newWithdrawAuthority = anchor.web3.Keypair.generate().publicKey;

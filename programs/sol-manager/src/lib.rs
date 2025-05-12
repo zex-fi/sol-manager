@@ -191,20 +191,16 @@ pub mod zex_asset_manager {
         // Token transfer pre-checks
         ctx.accounts.ensure_account_exist()?;
         ctx.accounts.ensure_sufficient_balance(amount)?;
+        
+        let bump_seed = ctx.bumps.main_vault;
+        let signer_seeds: &[&[&[u8]]] = &[&[MAIN_VAULTS_SEED, &[bump_seed]]];
 
-        // Do the token transfer
-        token::transfer(ctx.accounts.into_transfer_context(), amount)?;
+        token::transfer(ctx.accounts.into_transfer_context().with_signer(signer_seeds), amount)?;
         Ok(())
     }
 
     // todo :: this is for development phase remove for mainnet
-    // it is`nt possible to do it bulk in program because you need to pass them in context 
-    pub fn reset_withdraw_spl_id(
-        ctx: Context<ResetWithdrawSplId>,
-    ) -> Result<()> {
-        ctx.accounts.withdraw_id_record.used = false;
-        Ok(())
-    }
+    // it is`nt possible to do it bulk in program because you need to pass them in context
     
     pub fn reset_withdraw_sol_id(
         ctx: Context<ResetWithdrawSolId>,
@@ -388,7 +384,7 @@ impl<'info> TransferSplToMainVault<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(withdraw_id: u64)]
+#[instruction(amount:u64, withdraw_id: u64, signature: [u8; 64])]
 pub struct WithdrawSpl<'info> {
     #[account(mut, signer)]
     pub signer: AccountInfo<'info>,
@@ -484,23 +480,6 @@ impl<'info> WithdrawSpl<'info> {
 pub struct WithdrawIDRecord {
     pub used: bool,
 }
-
-#[derive(Accounts)]
-#[instruction(withdraw_id: u64)]
-pub struct ResetWithdrawSplId<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
-        bump,
-    )]
-    pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
-
-    pub system_program: Program<'info, System>,
-}
-
 
 #[derive(Accounts)]
 #[instruction(withdraw_id: u64)]
