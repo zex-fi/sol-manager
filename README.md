@@ -120,3 +120,14 @@ url = "https://api.apr.dev"
 ```
 solana-test-validator --reset
 ```
+
+
+## Buffer Error Deploy Solution
+```
+solana program deploy \
+  target/deploy/sol_manager.so \
+  --program-id      target/deploy/sol_manager-keypair.json \
+  --upgrade-authority ~/.config/solana/id.json \
+  --url             https://api.devnet.solana.com \
+  --max-len         400000
+```

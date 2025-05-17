@@ -314,7 +314,7 @@ pub struct WithdrawSol<'info> {
 #[derive(Accounts)]
 #[instruction(salt: u64)]
 pub struct TransferSplToMainVault<'info> {
-    #[account(signer)]
+    #[account(signer, mut)]
     pub signer: AccountInfo<'info>,
 
     #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_le_bytes()], bump)]
@@ -323,7 +323,12 @@ pub struct TransferSplToMainVault<'info> {
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
     pub main_vault: AccountInfo<'info>,
 
-    #[account(mut)]
+    #[account(
+        init_if_needed,
+        payer = signer,
+        associated_token::mint = mint,
+        associated_token::authority = user_vault
+    )]
     pub user_token_account: Account<'info, TokenAccount>,
 
     #[account(mut)]
