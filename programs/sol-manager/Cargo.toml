@@ -21,3 +21,4 @@ anchor-lang = { version = "0.31.0", features = ["init-if-needed"] }
 anchor-spl = "0.31.0"
 bs58 = "0.5.1"
 bytemuck = "1.19.0"
+sha3 = "0.10.1"

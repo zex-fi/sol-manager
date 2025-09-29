@@ -2911,4 +2911,5 @@ dependencies = [
  "anchor-spl",
  "bs58",
  "bytemuck",
+ "sha3",
 ]

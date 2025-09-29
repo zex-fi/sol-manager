@@ -129,5 +129,5 @@ solana program deploy \
   --program-id      target/deploy/sol_manager-keypair.json \
   --upgrade-authority ~/.config/solana/id.json \
   --url             https://api.devnet.solana.com \
-  --max-len         400000
+  --max-len         600000
 ```

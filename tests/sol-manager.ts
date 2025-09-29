@@ -15,12 +15,34 @@ import {
     transfer
 } from '@solana/spl-token';
 import {ASSOCIATED_PROGRAM_ID} from '@coral-xyz/anchor/dist/cjs/utils/token';
+import { createHash } from 'crypto';
 
 
 const ASSETMAN_CONFIG_SEEDS = Buffer.from("assetman-configs"); // Updated seed
 const MAIN_VAULTS_SEED = Buffer.from("main-vault");
 const USER_VAULTS_SEED = Buffer.from("user-vault");
 const WITHDRAW_ID_SEED = Buffer.from("withdraw-id");
+
+// Helper functions for salt encoding (matching Rust implementation)
+function encodeSalt(salt: number): Buffer {
+    const length = salt === 0 ? 1 : Math.floor((salt.toString(2).length + 7) / 8);
+    const bytes = Buffer.alloc(length);
+    
+    // Convert to big-endian bytes
+    for (let i = length - 1; i >= 0; i--) {
+        bytes[i] = (salt >> ((length - 1 - i) * 8)) & 0xFF;
+    }
+    
+    return bytes;
+}
+
+function computeTweakBy(salt: number): Buffer {
+    const encodedSalt = encodeSalt(salt);
+    const hash = createHash('sha3-256');
+    hash.update(Buffer.from('P'));
+    hash.update(encodedSalt);
+    return hash.digest();
+}
 
 
 
@@ -208,7 +230,7 @@ describe("zex-asset-manager", () => {
         let user_public_key : PublicKey;
 
         const user_salt = new anchor.BN(5);
-        const salt_bytes = user_salt.toBuffer("le", 8);
+        const salt_bytes = computeTweakBy(5);
 
         [user_public_key, ] = anchor.web3.PublicKey.findProgramAddressSync(
             [USER_VAULTS_SEED, salt_bytes],
@@ -216,7 +238,7 @@ describe("zex-asset-manager", () => {
         );
         console.log("Program ID:", program.programId.toBase58());
         console.log("USER_VAULTS_SEED:", USER_VAULTS_SEED);
-        console.log("Salt bytes (LE):", salt_bytes);
+        console.log("Salt bytes (SHA3-256):", salt_bytes);
         console.log("Salt bytes hex:", salt_bytes.toString("hex"));
         console.log("user_vault PDA:", user_public_key.toBase58());
         console.log("Bump seed:", bump);
@@ -241,9 +263,8 @@ describe("zex-asset-manager", () => {
         const txSig = await program.methods
             .transferSolToMainVault(user_salt)
             .accounts({
-                user_public_key,
-                vault_publicKey,
-                systemProgram: anchor.web3.SystemProgram.programId,
+                userVault: user_public_key,
+                mainVault: vault_publicKey,
             })
             .rpc();
 
@@ -267,7 +288,7 @@ describe("zex-asset-manager", () => {
         let user_vault : PublicKey;
 
         const user_salt = new anchor.BN(5);
-        const salt_bytes = user_salt.toBuffer("le", 8);
+        const salt_bytes = computeTweakBy(5);
 
         [user_vault, ] = anchor.web3.PublicKey.findProgramAddressSync(
             [USER_VAULTS_SEED, salt_bytes],

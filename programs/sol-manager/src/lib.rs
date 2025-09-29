@@ -10,6 +10,7 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount};
 use anchor_lang::solana_program::sysvar::instructions::{load_current_index_checked, load_instruction_at_checked};
 use anchor_lang::solana_program::program_error::ProgramError;
 use bs58;
+use sha3::{Digest, Sha3_256};
 
 const MIN_DEPOSIT_LAMPORTS: u64 = 1_000_000;
 const ASSETMAN_CONFIG_SEEDS: &[u8] = b"assetman-configs";
@@ -18,6 +19,28 @@ const USER_VAULTS_SEED: &[u8] = b"user-vault";
 const WITHDRAW_ID_SEED: &[u8] = b"withdraw-id";
 
 declare_id!("CVtFHhvpcXSxAhcmkwtSozQogJonYMZoC9m4BjB1pm3u");
+
+/// Encode salt to bytes using big-endian format
+fn encode_salt(salt: u64) -> Vec<u8> {
+    let length = if salt == 0 { 1 } else { (salt.ilog2() + 7) / 8 };
+    let mut bytes = Vec::with_capacity(length as usize);
+    
+    // Convert to big-endian bytes
+    for i in (0..length).rev() {
+        bytes.push(((salt >> (i * 8)) & 0xFF) as u8);
+    }
+    
+    bytes
+}
+
+/// Compute tweak by hashing the encoded salt with SHA3-256
+fn compute_tweak_by(salt: u64) -> [u8; 32] {
+    let encoded_salt = encode_salt(salt);
+    let mut hasher = Sha3_256::new();
+    hasher.update(b"P");
+    hasher.update(&encoded_salt);
+    hasher.finalize().into()
+}
 
 fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, withdraw_id: u64) -> Vec<u8> {
     let base58_address = bs58::encode(public_key.to_bytes()).into_string();
@@ -75,9 +98,10 @@ pub mod zex_asset_manager {
         require!(vault_lamports > MIN_DEPOSIT_LAMPORTS, CustomError::InsufficientFunds);
 
         let bump_seed = ctx.bumps.user_vault;
+        let tweak_bytes = compute_tweak_by(salt);
         let signer_seeds: &[&[&[u8]]] = &[&[
             USER_VAULTS_SEED,
-            &salt.to_le_bytes(),
+            &tweak_bytes,
             &[bump_seed]
         ]];
 
@@ -149,9 +173,10 @@ pub mod zex_asset_manager {
         let amount = user_token_account.amount;
 
         let bump_seed = ctx.bumps.user_vault;
+        let tweak_bytes = compute_tweak_by(salt);
         let signer_seeds: &[&[&[u8]]] = &[&[
             USER_VAULTS_SEED,
-            &salt.to_le_bytes(),
+            &tweak_bytes,
             &[bump_seed]
         ]];
 
@@ -231,7 +256,7 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = admin,
-        space = 8 + 32 + 32 * 10,
+        space = 8 + 4 + 32 + 32 * 10,
         seeds = [ASSETMAN_CONFIG_SEEDS],
         bump
     )]
@@ -271,7 +296,7 @@ pub struct SetWithdrawAuthority<'info> {
 #[derive(Accounts)]
 #[instruction(salt: u64)]
 pub struct TransferSolToMainVault<'info> {
-    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_le_bytes()], bump)]
+    #[account(mut, seeds = [USER_VAULTS_SEED, &compute_tweak_by(salt)], bump)]
     pub user_vault: AccountInfo<'info>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
@@ -317,7 +342,7 @@ pub struct TransferSplToMainVault<'info> {
     #[account(signer, mut)]
     pub signer: AccountInfo<'info>,
 
-    #[account(mut, seeds = [USER_VAULTS_SEED, &salt.to_le_bytes()], bump)]
+    #[account(mut, seeds = [USER_VAULTS_SEED, &compute_tweak_by(salt)], bump)]
     pub user_vault: AccountInfo<'info>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
