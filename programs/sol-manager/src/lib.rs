@@ -7,16 +7,20 @@ use anchor_lang::system_program::{transfer, Transfer};
 use anchor_lang::solana_program::sysvar::rent::Rent;
 use anchor_spl::associated_token::{self, AssociatedToken};
 use anchor_spl::token::{self, Mint, Token, TokenAccount};
-use anchor_lang::solana_program::sysvar::instructions::{load_current_index_checked, load_instruction_at_checked};
+use anchor_lang::solana_program::sysvar::{
+    self, 
+    instructions::{load_current_index_checked, load_instruction_at_checked}
+};
 use bs58;
 
-const ASSETMAN_CONFIG_SEEDS: &[u8] = b"assetman-configs";
+const ASSETMAN_CONFIG_V1_SEEDS: &[u8] = b"assetman-configs";
+const ASSETMAN_CONFIG_SEEDS: &[u8] = b"assetman-configs-v2";
 const MAIN_VAULTS_SEED: &[u8] = b"main-vault";
 const USER_VAULTS_SEED: &[u8] = b"user-vault";
 const WITHDRAW_ID_SEED: &[u8] = b"withdraw-id";
 const MAX_WITHDRAWER_LEN: usize = 10;
 
-declare_id!("AjhejxyRBm2TvENEsaxCbmiJj3sMc6W5JnxLMDKvaZRn");
+declare_id!("YHXAM22ivWgtn3qk4bmX64dREsZbRp6gYd6MfqFPjG5");
 
 fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, withdraw_id: u64) -> Vec<u8> {
     let base58_address = bs58::encode(public_key.to_bytes()).into_string();
@@ -42,8 +46,24 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    pub fn migrate_configs(ctx: Context<MigrateConfigs>) -> Result<()> {
+        let old = &ctx.accounts.old_configs;
+        let new = &mut ctx.accounts.new_configs;
+
+        new.admin = old.admin;
+        new.withdrawers = old.withdrawers.clone();
+        new.frost_pubkey = old.frost_pubkey;
+        new.paused = false;
+
+        Ok(())
+    }
+
+    pub fn set_pause(ctx: Context<SetPause>, paused: bool) -> Result<()> {
+        ctx.accounts.configs.paused = paused;
+        Ok(())
+    }
+
     // Transfer admin role to new PubKey
-    #[access_control(ctx.accounts.configs.is_admin(&ctx.accounts.admin))]
     pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
 
@@ -54,7 +74,6 @@ pub mod zex_asset_manager {
     }
 
     // Add a new withdrawer to the Configs
-    #[access_control(ctx.accounts.configs.is_admin(&ctx.accounts.admin))]
     pub fn withdrawer_add(ctx: Context<WithdrawerAdd>, new_withdrawer: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
         require!(!configs.withdrawers.contains(&new_withdrawer), CustomError::DuplicateError);
@@ -64,18 +83,15 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
-    #[access_control(ctx.accounts.configs.is_admin(&ctx.accounts.admin))]
     pub fn withdrawer_delete(ctx: Context<WithdrawerDelete>, withdrawer_to_remove: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
         let wr_index = configs.withdrawers.iter().position(|&wr| wr == withdrawer_to_remove);
         require!(wr_index.is_some(), CustomError::MissingData);
-        require!(configs.withdrawers.len() > 1, CustomError::EmptyWithdrawer);
         
         configs.withdrawers.remove(wr_index.unwrap());
         Ok(())
     }
 
-    #[access_control(ctx.accounts.configs.is_admin(&ctx.accounts.admin))]
     pub fn set_frost_pubkey(ctx: Context<SetFrostPubkey>, frost_pubkey: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
 
@@ -214,6 +230,77 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    pub fn emergency_withdraw_sol(
+        ctx: Context<EmergencyWithdrawSol>,
+        amount: u64,
+    ) -> Result<()> {
+        let vault = &ctx.accounts.main_vault;
+
+        let vault_lamports = **vault.lamports.borrow();
+        let rent_exempt_minimum = Rent::get()?.minimum_balance(vault.data_len());
+        let transferable = vault_lamports.saturating_sub(rent_exempt_minimum);
+
+        require!(amount <= transferable, CustomError::InsufficientFunds);
+
+        let bump = ctx.bumps.main_vault;
+        let signer_seeds: &[&[&[u8]]] = &[&[
+            MAIN_VAULTS_SEED,
+            &[bump],
+        ]];
+
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.main_vault.to_account_info(),
+                to: ctx.accounts.destination.to_account_info(),
+            },
+        )
+        .with_signer(signer_seeds);
+
+        transfer(cpi_ctx, amount)?;
+
+        emit!(EmergencyWithdraw {
+            admin: ctx.accounts.admin.key(),
+            mint: None,
+            amount,
+            destination: ctx.accounts.destination.key(),
+        });
+
+        Ok(())
+    }
+
+    pub fn emergency_withdraw_spl(
+        ctx: Context<EmergencyWithdrawSpl>,
+        amount: u64,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.main_vault_token_account.amount >= amount,
+            CustomError::InsufficientFunds
+        );
+
+        let bump = ctx.bumps.main_vault;
+        let signer_seeds: &[&[&[u8]]] = &[&[
+            MAIN_VAULTS_SEED,
+            &[bump],
+        ]];
+
+        token::transfer(
+            ctx.accounts
+                .into_transfer_context()
+                .with_signer(signer_seeds),
+            amount,
+        )?;
+
+        emit!(EmergencyWithdraw {
+            admin: ctx.accounts.admin.key(),
+            mint: Some(ctx.accounts.mint.key()),
+            amount,
+            destination: ctx.accounts.destination.key(),
+        });
+
+        Ok(())
+    }
+
     // todo :: this is for development phase remove for mainnet
     // it is`nt possible to do it bulk in program because you need to pass them in context
     
@@ -225,6 +312,16 @@ pub mod zex_asset_manager {
     // }
 }
 
+// Define the legacy Configs account
+#[account]
+#[derive(Default, InitSpace)]
+pub struct ConfigsV1 {
+    admin: Pubkey,
+    #[max_len(MAX_WITHDRAWER_LEN)]
+    withdrawers: Vec<Pubkey>,
+    frost_pubkey: Pubkey,
+}
+
 // Define the Configs account
 #[account]
 #[derive(Default, InitSpace)]
@@ -233,6 +330,7 @@ pub struct Configs {
     #[max_len(MAX_WITHDRAWER_LEN)]
     withdrawers: Vec<Pubkey>,
     frost_pubkey: Pubkey,
+    paused: bool,
 }
 
 impl Configs {
@@ -266,29 +364,75 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
-pub struct TransferAdmin<'info> {
+pub struct MigrateConfigs<'info> {
+    #[account(seeds = [ASSETMAN_CONFIG_V1_SEEDS], bump)]
+    pub old_configs: Account<'info, ConfigsV1>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + Configs::INIT_SPACE,
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump
+    )]
+    pub new_configs: Account<'info, Configs>,
+
     #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetPause<'info> {
+    #[account(
+        mut, 
+        seeds = [ASSETMAN_CONFIG_SEEDS], 
+        bump,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
+    pub configs: Account<'info, Configs>,
+
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct TransferAdmin<'info> {
+    #[account(
+        mut, 
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
     pub configs: Account<'info, Configs>,
     pub admin: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct WithdrawerAdd<'info> {
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
     pub configs: Account<'info, Configs>,
     pub admin: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct WithdrawerDelete<'info> {
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
     pub configs: Account<'info, Configs>,
     pub admin: Signer<'info>,
 }
 
 #[derive(Accounts)]
 pub struct SetFrostPubkey<'info> {
-    #[account(mut, seeds = [ASSETMAN_CONFIG_SEEDS], bump)]
+    #[account(
+        mut, 
+        seeds = [ASSETMAN_CONFIG_SEEDS], 
+        bump,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
     pub configs: Account<'info, Configs>,
 
     #[account(mut)]
@@ -312,7 +456,11 @@ pub struct TransferSolToMainVault<'info> {
 #[derive(Accounts)]
 #[instruction(amount:u64, withdraw_id: u64, signature: [u8; 64])]
 pub struct WithdrawSol<'info> {
-    #[account(seeds = [ASSETMAN_CONFIG_SEEDS], bump)]
+    #[account(
+        seeds = [ASSETMAN_CONFIG_SEEDS], 
+        bump,
+        constraint = !configs.paused @ CustomError::ProgramPaused
+    )]
     pub configs: Account<'info, Configs>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
@@ -321,6 +469,7 @@ pub struct WithdrawSol<'info> {
     #[account(mut)]
     pub destination: SystemAccount<'info>,
 
+    #[account(address = sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
 
     /// CHECK: PDA withdraw_id record, checked in code
@@ -405,7 +554,11 @@ pub struct WithdrawSpl<'info> {
     )]
     pub signer: AccountInfo<'info>,
 
-    #[account(seeds = [ASSETMAN_CONFIG_SEEDS], bump)]
+    #[account(
+        seeds = [ASSETMAN_CONFIG_SEEDS], 
+        bump,
+        constraint = !configs.paused @ CustomError::ProgramPaused
+    )]
     pub configs: Account<'info, Configs>,
 
     #[account(mut, seeds = [MAIN_VAULTS_SEED], bump)]
@@ -431,6 +584,7 @@ pub struct WithdrawSpl<'info> {
     #[account(constraint = mint.supply > 0 @ CustomError::InvalidMint)]
     pub mint: Account<'info, Mint>,
 
+    #[account(address = sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
     
     /// init_if_needed change to init in mainnet
@@ -476,6 +630,97 @@ pub struct WithdrawIDRecord {
     pub used: bool,
 }
 
+#[derive(Accounts)]
+#[instruction(amount: u64)]
+pub struct EmergencyWithdrawSol<'info> {
+    #[account(
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
+    pub configs: Account<'info, Configs>,
+
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MAIN_VAULTS_SEED],
+        bump
+    )]
+    pub main_vault: SystemAccount<'info>,
+
+    #[account(mut)]
+    pub destination: SystemAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(amount: u64)]
+pub struct EmergencyWithdrawSpl<'info> {
+    #[account(
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
+    pub configs: Account<'info, Configs>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [MAIN_VAULTS_SEED],
+        bump
+    )]
+    pub main_vault: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = main_vault
+    )]
+    pub main_vault_token_account: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub destination: AccountInfo<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = admin,
+        associated_token::mint = mint,
+        associated_token::authority = destination
+    )]
+    pub destination_token_account: Account<'info, TokenAccount>,
+
+    pub mint: Account<'info, Mint>,
+
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+}
+
+impl<'info> EmergencyWithdrawSpl<'info> {
+    fn into_transfer_context(
+        &self,
+    ) -> CpiContext<'info, 'info, 'info, 'info, token::Transfer<'info>> {
+        let cpi_accounts = token::Transfer {
+            from: self.main_vault_token_account.to_account_info(),
+            to: self.destination_token_account.to_account_info(),
+            authority: self.main_vault.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), cpi_accounts)
+    }
+}
+
+#[event]
+pub struct EmergencyWithdraw {
+    pub admin: Pubkey,
+    pub mint: Option<Pubkey>,
+    pub amount: u64,
+    pub destination: Pubkey,
+}
+
 // #[derive(Accounts)]
 // #[instruction(withdraw_id: u64)]
 // pub struct ResetWithdrawSolId<'info> {
@@ -504,8 +749,6 @@ pub enum CustomError {
     DuplicateError,
     #[msg("Overflow error")]
     OverflowError,
-    #[msg("Empty withdrawer error")]
-    EmptyWithdrawer,
     #[msg("Unauthorized access")]
     Unauthorized,
     #[msg("Missing data")]
@@ -518,4 +761,6 @@ pub enum CustomError {
     InvalidMint,
     #[msg("Mint mismatch.")]
     MintMismatch,
+    #[msg("Program is paused")]
+    ProgramPaused,
 }
