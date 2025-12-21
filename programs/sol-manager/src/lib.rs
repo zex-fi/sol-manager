@@ -1,5 +1,19 @@
 #![allow(unexpected_cfgs)]
 
+/*
+    ============================================================
+    ZEX ASSET MANAGER
+    ------------------------------------------------------------
+    - Custodial aggregation vault for SOL and SPL tokens
+    - Per-user deposit PDAs
+    - Single main vault PDA
+    - Withdrawals protected by:
+        * Authorized on-chain withdrawer
+        * Off-chain Ed25519 (FROST) signature
+        * withdraw_id replay protection
+    ============================================================
+*/
+
 mod ed25519;
 
 use anchor_lang::{prelude::*, system_program};
@@ -8,20 +22,45 @@ use anchor_lang::solana_program::sysvar::rent::Rent;
 use anchor_spl::associated_token::{self, AssociatedToken};
 use anchor_spl::token::{self, Mint, Token, TokenAccount};
 use anchor_lang::solana_program::sysvar::{
-    self, 
+    self,
     instructions::{load_current_index_checked, load_instruction_at_checked}
 };
 use bs58;
 
+/*
+    ============================================================
+    PDA SEEDS & CONSTANTS
+    ============================================================
+*/
+
+/// Legacy config PDA (v1)
 const ASSETMAN_CONFIG_V1_SEEDS: &[u8] = b"assetman-configs";
+
+/// Current config PDA (v2)
 const ASSETMAN_CONFIG_SEEDS: &[u8] = b"assetman-configs-v2";
+
+/// Main vault PDA (global custody)
 const MAIN_VAULTS_SEED: &[u8] = b"main-vault";
+
+/// Per-user deposit vault PDA
 const USER_VAULTS_SEED: &[u8] = b"user-vault";
+
+/// Replay protection PDA for withdrawals
 const WITHDRAW_ID_SEED: &[u8] = b"withdraw-id";
+
+/// Maximum number of authorized withdrawers
 const MAX_WITHDRAWER_LEN: usize = 10;
 
 declare_id!("YHXAM22ivWgtn3qk4bmX64dREsZbRp6gYd6MfqFPjG5");
 
+/*
+    ============================================================
+    SIGNED WITHDRAW MESSAGE FORMAT
+    ------------------------------------------------------------
+    This function MUST exactly match the off-chain signing logic.
+    Any formatting mismatch invalidates signatures.
+    ============================================================
+*/
 fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, withdraw_id: u64) -> Vec<u8> {
     let base58_address = bs58::encode(public_key.to_bytes()).into_string();
     let formatted_string = format!(
@@ -35,17 +74,38 @@ fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, withdraw_
 pub mod zex_asset_manager {
     use super::*;
 
-    // Initialize the Configs
+    /*
+        ------------------------------------------------------------
+        initialize
+        ------------------------------------------------------------
+        Creates the global configuration PDA.
+
+        Authority:
+        - Caller becomes admin
+
+        Security:
+        - frost_pubkey must be non-zero
+        - PDA seed prevents reinitialization
+    */
     pub fn initialize(ctx: Context<Initialize>, frost_pubkey: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
         configs.admin = ctx.accounts.admin.key();
 
         require!(frost_pubkey != Pubkey::default(), CustomError::MissingData);
         configs.frost_pubkey = frost_pubkey;
-        
         Ok(())
     }
 
+    /*
+        ------------------------------------------------------------
+        migrate_configs
+        ------------------------------------------------------------
+        One-time migration from ConfigsV1 to Configs.
+
+        Security:
+        - Copies admin, withdrawers, frost_pubkey
+        - paused defaults to false
+    */
     pub fn migrate_configs(ctx: Context<MigrateConfigs>) -> Result<()> {
         let old = &ctx.accounts.old_configs;
         let new = &mut ctx.accounts.new_configs;
@@ -58,12 +118,30 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /*
+        ------------------------------------------------------------
+        set_pause
+        ------------------------------------------------------------
+        Global emergency stop for withdrawals.
+
+        Effect:
+        - Blocks withdraw_sol and withdraw_spl
+    */
     pub fn set_pause(ctx: Context<SetPause>, paused: bool) -> Result<()> {
         ctx.accounts.configs.paused = paused;
         Ok(())
     }
 
-    // Transfer admin role to new PubKey
+    /*
+        ------------------------------------------------------------
+        transfer_admin
+        ------------------------------------------------------------
+        Transfers admin role.
+
+        Security:
+        - Only current admin
+        - new_admin must be non-zero
+    */
     pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
 
@@ -73,7 +151,16 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
-    // Add a new withdrawer to the Configs
+    /*
+        ------------------------------------------------------------
+        withdrawer_add
+        ------------------------------------------------------------
+        Adds an authorized on-chain withdraw executor.
+
+        Important:
+        - Withdrawers CANNOT withdraw alone
+        - Off-chain FROST signature still required
+    */
     pub fn withdrawer_add(ctx: Context<WithdrawerAdd>, new_withdrawer: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
         require!(!configs.withdrawers.contains(&new_withdrawer), CustomError::DuplicateError);
@@ -83,6 +170,12 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /*
+        ------------------------------------------------------------
+        withdrawer_delete
+        ------------------------------------------------------------
+        Revokes withdrawer authority immediately.
+    */
     pub fn withdrawer_delete(ctx: Context<WithdrawerDelete>, withdrawer_to_remove: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
         let wr_index = configs.withdrawers.iter().position(|&wr| wr == withdrawer_to_remove);
@@ -92,6 +185,12 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /*
+        ------------------------------------------------------------
+        set_frost_pubkey
+        ------------------------------------------------------------
+        Rotates off-chain multisig authority.
+    */
     pub fn set_frost_pubkey(ctx: Context<SetFrostPubkey>, frost_pubkey: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
 
@@ -101,6 +200,18 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /*
+        ------------------------------------------------------------
+        transfer_sol_to_main_vault
+        ------------------------------------------------------------
+        Permissionless sweep of SOL from user vault PDA
+        to the main vault PDA.
+
+        Security:
+        - Funds remain program-owned
+        - No withdrawal to EOAs
+        - Anyone may call safely
+    */
     pub fn transfer_sol_to_main_vault(
         ctx: Context<TransferSolToMainVault>,
         salt: [u8; 32],
@@ -128,6 +239,20 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /*
+        ------------------------------------------------------------
+        withdraw_sol
+        ------------------------------------------------------------
+        Withdraws SOL from the main vault.
+
+        Required approvals:
+        1. Authorized withdrawer signer
+        2. Valid Ed25519 (FROST) signature
+        3. Unused withdraw_id
+
+        Replay Protection:
+        - withdraw_id PDA
+    */
     pub fn withdraw_sol(
         ctx: Context<WithdrawSol>,
         amount: u64,
@@ -174,6 +299,11 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /// Transfer all SPL tokens from user's vault to main vault
+    ///
+    /// - Anyone can call.
+    /// - User vault: PDA derived from USER_VAULTS_SEED + salt.
+    /// - Main vault: PDA derived from MAIN_VAULTS_SEED.
     pub fn transfer_spl_to_main_vault(
         ctx: Context<TransferSplToMainVault>,
         salt: [u8; 32]
@@ -192,6 +322,12 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /// Withdraw SPL token from main vault using off-chain signature
+    ///
+    /// - Checks withdraw_id for replay protection.
+    /// - Verifies off-chain signature via frost_pubkey.
+    /// - Only registered withdrawers can call.
+    /// - Requires main vault to have sufficient balance.
     pub fn withdraw_spl(
         ctx: Context<WithdrawSpl>,
         amount: u64,
@@ -230,6 +366,15 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    // =========================
+    // EMERGENCY WITHDRAWALS (ADMIN ONLY)
+    // =========================
+
+    /// Emergency SOL withdrawal by admin
+    ///
+    /// - Admin only.
+    /// - Transfers lamports rent-exempt aware.
+    /// - Emits EmergencyWithdraw event.
     pub fn emergency_withdraw_sol(
         ctx: Context<EmergencyWithdrawSol>,
         amount: u64,
@@ -269,6 +414,11 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    /// Emergency SPL token withdrawal by admin
+    ///
+    /// - Admin only.
+    /// - Transfers SPL tokens from main vault PDA to destination.
+    /// - Emits EmergencyWithdraw event.
     pub fn emergency_withdraw_spl(
         ctx: Context<EmergencyWithdrawSpl>,
         amount: u64,
