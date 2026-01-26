@@ -724,7 +724,7 @@ pub struct WithdrawSpl<'info> {
     pub destination: AccountInfo<'info>,
 
     #[account(
-        init,
+        init_if_needed,
         payer = signer,
         associated_token::mint = mint,
         associated_token::authority = destination,
