@@ -90,6 +90,8 @@ pub mod zex_asset_manager {
     pub fn initialize(ctx: Context<Initialize>, frost_pubkey: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
         configs.admin = ctx.accounts.admin.key();
+        configs.pending_admin = None;
+        configs.paused = false;
 
         require!(frost_pubkey != Pubkey::default(), CustomError::MissingData);
         configs.frost_pubkey = frost_pubkey;
@@ -111,6 +113,7 @@ pub mod zex_asset_manager {
         let new = &mut ctx.accounts.new_configs;
 
         new.admin = old.admin;
+        new.pending_admin = None;
         new.withdrawers = old.withdrawers.clone();
         new.frost_pubkey = old.frost_pubkey;
         new.paused = false;
@@ -134,20 +137,78 @@ pub mod zex_asset_manager {
 
     /*
         ------------------------------------------------------------
-        transfer_admin
+        propose_admin
         ------------------------------------------------------------
-        Transfers admin role.
+        Step 1 of admin transfer.
+
+        Effect:
+        - Sets `pending_admin`
+        - Does NOT transfer admin role yet
 
         Security:
-        - Only current admin
-        - new_admin must be non-zero
+        - Only current admin may call
+        - Prevents accidental admin loss
+        - New admin must explicitly accept
     */
-    pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
+    pub fn propose_admin(ctx: Context<ProposeAdmin>, new_admin: Pubkey) -> Result<()> {
         let configs = &mut ctx.accounts.configs;
 
         require!(new_admin != Pubkey::default(), CustomError::MissingData);
-        configs.admin = new_admin;
+        require!(new_admin != configs.admin, CustomError::DuplicateError);
 
+        configs.pending_admin = Some(new_admin);
+
+        Ok(())
+    }
+
+    /*
+        ------------------------------------------------------------
+        accept_admin
+        ------------------------------------------------------------
+        Step 2 of admin transfer.
+
+        Effect:
+        - Transfers admin role to `pending_admin`
+        - Clears `pending_admin`
+
+        Security:
+        - Must be called by pending admin
+        - Prevents forced admin takeover
+    */
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        let configs = &mut ctx.accounts.configs;
+
+        let pending = configs
+            .pending_admin
+            .ok_or(CustomError::NoPendingAdmin)?;
+
+        require!(
+            pending == ctx.accounts.new_admin.key(),
+            CustomError::Unauthorized
+        );
+
+        configs.admin = pending;
+        configs.pending_admin = None;
+
+        Ok(())
+    }
+
+    /*
+        ------------------------------------------------------------
+        cancel_admin_proposal
+        ------------------------------------------------------------
+        Cancels a pending admin transfer.
+
+        Effect:
+        - Clears `pending_admin`
+        - Admin remains unchanged
+
+        Security:
+        - Only current admin may call
+        - Prevents stuck or incorrect admin proposals
+    */
+    pub fn cancel_admin_proposal(ctx: Context<CancelAdminProposal>) -> Result<()> {
+        ctx.accounts.configs.pending_admin = None;
         Ok(())
     }
 
@@ -476,11 +537,12 @@ pub struct ConfigsV1 {
 #[account]
 #[derive(Default, InitSpace)]
 pub struct Configs {
-    admin: Pubkey,
+    pub admin: Pubkey,
+    pub pending_admin: Option<Pubkey>,
     #[max_len(MAX_WITHDRAWER_LEN)]
-    withdrawers: Vec<Pubkey>,
-    frost_pubkey: Pubkey,
-    paused: bool,
+    pub withdrawers: Vec<Pubkey>,
+    pub frost_pubkey: Pubkey,
+    pub paused: bool,
 }
 
 impl Configs {
@@ -546,9 +608,11 @@ pub struct SetPause<'info> {
 }
 
 #[derive(Accounts)]
-pub struct TransferAdmin<'info> {
+pub struct ProposeAdmin<'info> {
     #[account(
         mut, 
+        seeds = [ASSETMAN_CONFIG_SEEDS], 
+        bump,
         constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
     )]
     pub configs: Account<'info, Configs>,
@@ -556,9 +620,35 @@ pub struct TransferAdmin<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    #[account(
+        mut,
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump
+    )]
+    pub configs: Account<'info, Configs>,
+    pub new_admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct CancelAdminProposal<'info> {
+    #[account(
+        mut,
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
+    pub configs: Account<'info, Configs>,
+
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct WithdrawerAdd<'info> {
     #[account(
         mut,
+        seeds = [ASSETMAN_CONFIG_SEEDS], 
+        bump,
         constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
     )]
     pub configs: Account<'info, Configs>,
@@ -569,6 +659,8 @@ pub struct WithdrawerAdd<'info> {
 pub struct WithdrawerDelete<'info> {
     #[account(
         mut,
+        seeds = [ASSETMAN_CONFIG_SEEDS], 
+        bump,
         constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
     )]
     pub configs: Account<'info, Configs>,
@@ -893,6 +985,8 @@ pub struct EmergencyWithdraw {
 pub enum CustomError {
     #[msg("Admin restricted method")]
     AdminRestricted,
+    #[msg("No pending admin to accept")]
+    NoPendingAdmin,
     #[msg("Unauthorized withdrawer")]
     UnauthorizedWithdrawer,
     #[msg("Duplicate entry")]
