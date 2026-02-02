@@ -16,12 +16,13 @@ import { ASSOCIATED_PROGRAM_ID } from '@coral-xyz/anchor/dist/cjs/utils/token';
 import { createHash } from 'crypto';
 import { expect } from "chai";
 import { keyGen, signFrost } from "./frost-utils";
+import { resolve } from "path";
 
 
 const ASSETMAN_CONFIG_SEEDS = Buffer.from("assetman-configs-v2"); // Updated seed
 const MAIN_VAULTS_SEED = Buffer.from("main-vault");
 const USER_VAULTS_SEED = Buffer.from("user-vault");
-const WITHDRAW_ID_SEED = Buffer.from("withdraw-id");
+const WITHDRAW_ID_SEED = Buffer.from("withdraw-id-v2");
 
 // Helper functions for salt encoding (matching Rust implementation)
 function encodeSalt(salt: number): Buffer {
@@ -59,6 +60,8 @@ describe("zex-asset-manager", () => {
 
     let oldAdmin: anchor.web3.Keypair = anchor.web3.Keypair.generate();
     let admin: anchor.web3.Keypair = anchor.web3.Keypair.generate();
+    let operator: anchor.web3.Keypair = anchor.web3.Keypair.generate();
+    let reclaimDest = anchor.web3.Keypair.generate().publicKey;
     // fs.writeFileSync("admin.json", JSON.stringify(Array.from(newAdmin.secretKey)));
 
     const withdrawers = [0, 1, 2, 3, 4].map(_ => anchor.web3.Keypair.generate())
@@ -154,7 +157,15 @@ describe("zex-asset-manager", () => {
         await provider.connection.confirmTransaction(sig2);
     }
 
-    async function withdrawSol(amount: any, destination: PublicKey, withdrawId: any, signer: Keypair) {
+    function getTimestamp(): number {
+        return Math.floor(Date.now() / 1000);
+    }
+
+    function timeout(ms: number) {
+        return new Promise((resolve) => setTimeout(resolve, ms))
+    }
+
+    async function withdrawSol(amount: any, destination: PublicKey, withdrawId: any, signer: Keypair, expireAt?: number | anchor.BN) {
         amount = new anchor.BN(amount);
         withdrawId = new anchor.BN(withdrawId);
 
@@ -164,10 +175,15 @@ describe("zex-asset-manager", () => {
             program.programId
         );
 
+        if(expireAt === undefined)
+            expireAt = getTimestamp() + 1000;
+
+        expireAt = new anchor.BN(expireAt);
+
         // Build message as defined in your program
         const base58Dest = bs58.encode(destination.toBytes());
         const message = Buffer.from(
-            `allowed withdraw ${amount.toString()} SOL to address ${base58Dest} with withdraw_id ${withdrawId.toString()}`
+            `allowed withdraw ${amount.toString()} SOL to address ${base58Dest} with withdraw_id ${withdrawId.toString()} expire at: ${expireAt}`
         );
 
         const signatureStr = signFrost(message, keyPackages, pubkeyPackage);
@@ -187,7 +203,7 @@ describe("zex-asset-manager", () => {
         // console.log("destination", destination);
         const programIx = await program.methods
             // @ts-ignore
-            .withdrawSol(amount, withdrawId, signature)
+            .withdrawSol(amount, withdrawId, signature, expireAt)
             .accounts({
                 signer: signer.publicKey,
                 configs: configs_publicKey,
@@ -205,7 +221,7 @@ describe("zex-asset-manager", () => {
         await provider.sendAndConfirm(tx, [signer]);
     }
 
-    async function withdrawSpl(amount: any, destination: PublicKey, withdrawId: any, signer: Keypair) {
+    async function withdrawSpl(amount: any, destination: PublicKey, withdrawId: any, signer: Keypair, expireAt?: number | anchor.BN) {
         amount = new anchor.BN(amount);
         withdrawId = new anchor.BN(withdrawId);
         const withdrawIdByte = withdrawId.toArrayLike(Buffer, "le", 8);
@@ -220,11 +236,14 @@ describe("zex-asset-manager", () => {
         const destination_token_account = getAssociatedTokenAddressSync(mint, destination, true);
         const main_vault_token_account = getAssociatedTokenAddressSync(mint, vault_publicKey, true);
 
+        if(expireAt === undefined)
+            expireAt = getTimestamp() + 1000;
+        expireAt = new anchor.BN(expireAt);
 
         // Build message as defined in your program
         const base58Dest = bs58.encode(destination.toBytes());
         const message = Buffer.from(
-            `allowed withdraw ${amount.toString()} ${mint.toString()} to address ${base58Dest} with withdraw_id ${withdrawId.toString()}`
+            `allowed withdraw ${amount.toString()} ${mint.toString()} to address ${base58Dest} with withdraw_id ${withdrawId.toString()} expire at: ${expireAt}`
         );
 
         const signatureStr = signFrost(message, keyPackages, pubkeyPackage);
@@ -239,7 +258,7 @@ describe("zex-asset-manager", () => {
 
         const programIx = await program.methods
             // @ts-ignore
-            .withdrawSpl(amount, withdrawId, signature)
+            .withdrawSpl(amount, withdrawId, signature, expireAt)
             .accounts({
                 signer: signer.publicKey,
                 configs: configs_publicKey,
@@ -384,7 +403,7 @@ describe("zex-asset-manager", () => {
         assert.ok(!configs2.withdrawers.map((k) => k.toBase58()).includes(withdrawers[1].publicKey.toBase58()), "Withdrwer is not removed");
     });
 
-    it("Transfers SOL to vault", async () => {
+    it("Transfers SOL to main vault", async () => {
         let user_vault: PublicKey;
         const salt_bytes = computeTweakBy(1);
 
@@ -421,7 +440,7 @@ describe("zex-asset-manager", () => {
         );
     });
 
-    it("Transfers SPL to vault", async () => {
+    it("Transfers SPL to main vault", async () => {
         let user_vault: PublicKey;
 
         const salt_bytes = computeTweakBy(5);
@@ -494,6 +513,32 @@ describe("zex-asset-manager", () => {
         }
     });
 
+    it("Unable to Withdraw SOL with expired signature", async () => {
+        const destination = anchor.web3.Keypair.generate().publicKey;
+        const withdrawId = 1;
+        const amount = 100_000_000;
+
+        const sig2 = await provider.connection.requestAirdrop(
+            vault_publicKey,
+            10 * anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig2);
+        const initialVaultBalance = await provider.connection.getBalance(destination);
+
+        const sig3 = await provider.connection.requestAirdrop(
+            withdrawers[0].publicKey,
+            10 * anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig3);
+
+        try {
+            await withdrawSol(amount, destination, withdrawId, withdrawers[0], getTimestamp() - 10000)
+            expect.fail("Transaction should have failed");
+        } catch (err: any) {
+            expect(err.message).to.match(/Signature expired/i);
+        }
+    });
+
     it("Withdraw SOL From Vault", async () => {
         const destination = anchor.web3.Keypair.generate().publicKey;
         const withdrawId = 1;
@@ -537,6 +582,20 @@ describe("zex-asset-manager", () => {
         }
     });
 
+    it("Unable to Withdraw SPL with expired signature", async () => {
+        const destination = anchor.web3.Keypair.generate().publicKey;
+
+        const amount = 1000;
+        const withdrawId = 2;     
+
+        try {
+            await withdrawSpl(amount, destination, withdrawId, withdrawers[0], getTimestamp() - 10000) 
+            expect.fail("Transaction should have failed");
+        } catch (err: any) {
+            expect(err.message).to.match(/Signature expired/i);
+        }
+    });
+
     it("Withdraw SPL From Vault", async () => {
         const destination = anchor.web3.Keypair.generate().publicKey;
 
@@ -553,5 +612,288 @@ describe("zex-asset-manager", () => {
             finalVaultBalance.value.amount,
             "Vault balance should increase by transferred amount"
         );
+    });
+
+    it("Only admin can update operator address", async () => {
+        // non-admin tries
+        try {
+            await program.methods
+                .updateOperator(operator.publicKey)
+                .accounts({
+                    configs: configs_publicKey,
+                    admin: withdrawers[0].publicKey,
+                })
+                .signers([withdrawers[0]])
+                .rpc();
+
+            expect.fail("Non-admin should not be able to update operator");
+        } catch (err: any) {
+            expect(err.message).to.match(/Admin restricted method/i);
+        }
+
+        // admin succeeds
+        await program.methods
+            .updateOperator(operator.publicKey)
+            .accounts({
+                configs: configs_publicKey,
+                admin: admin.publicKey,
+            })
+            .signers([admin])
+            .rpc();
+
+        const config = await program.account.configs.fetch(configs_publicKey);
+        expect(config.operator.toBase58()).to.equal(operator.publicKey.toBase58());
+    });
+
+    it("only admin can set reclaim_to reclaim_to", async () => {
+        // non-admin should fail
+        try {
+            await program.methods
+                .setReclaimTo(reclaimDest)
+                .accounts({
+                    admin: withdrawers[0].publicKey,
+                })
+                .signers([withdrawers[0]])
+                .rpc();
+
+            expect.fail("Non-admin was able to set reclaim_to");
+        } catch (err: any) {
+            expect(err.message).to.match(/Admin restricted/i);
+        }
+
+        // admin succeeds
+        await program.methods
+            .setReclaimTo(reclaimDest)
+            .accounts({
+                admin: admin.publicKey,
+            })
+            .signers([admin])
+            .rpc();
+
+        const configs = await program.account.configs.fetch(configs_publicKey);
+        expect(configs.reclaimTo).to.not.equal(null);
+        expect(configs.reclaimTo.toBase58()).to.equal(reclaimDest.toBase58());
+
+        // admin can also unset (set to None)
+        await program.methods
+            .setReclaimTo(null)
+            .accounts({
+                admin: admin.publicKey,
+            })
+            .signers([admin])
+            .rpc();
+
+        const configsAfter = await program.account.configs.fetch(configs_publicKey);
+        expect(configsAfter.reclaimTo).to.equal(null);
+    })
+
+    it("Unable to reclaim without setting reclaim_to", async () => {
+        const destination = anchor.web3.Keypair.generate().publicKey;
+        const withdrawId = 555;
+        const amount = 20_000_000;
+
+        // ensure reclaim_to is unset
+        await program.methods
+            .setReclaimTo(null)
+            .accounts({
+                admin: admin.publicKey,
+            })
+            .signers([admin])
+            .rpc();
+
+        // fund main vault
+        await provider.connection.confirmTransaction(
+            await provider.connection.requestAirdrop(
+                vault_publicKey,
+                anchor.web3.LAMPORTS_PER_SOL
+            )
+        );
+
+        // fund withdrawer
+        await provider.connection.confirmTransaction(
+            await provider.connection.requestAirdrop(
+                withdrawers[0].publicKey,
+                anchor.web3.LAMPORTS_PER_SOL
+            )
+        );
+
+        const expireAt = getTimestamp() + 1;
+
+        await withdrawSol(amount, destination, withdrawId, withdrawers[0], expireAt);
+
+        // wait until expired
+        await new Promise((r) => setTimeout(r, 2000));
+
+        const withdrawIdBN = new anchor.BN(withdrawId);
+        const withdrawIdBytes = withdrawIdBN.toArrayLike(Buffer, "le", 8);
+
+        const [withdrawIdRecordPDA] = PublicKey.findProgramAddressSync(
+            [WITHDRAW_ID_SEED, withdrawIdBytes],
+            program.programId
+        );
+
+        // operator tries reclaim → must fail because reclaim_to is None
+        try {
+            await program.methods
+                .reclaimWithdrawId(withdrawIdBN)
+                .accounts({
+                    reclaimTo: reclaimDest, // even if passed, config blocks it
+                    operator: operator.publicKey,
+                })
+                .signers([operator])
+                .rpc();
+
+            expect.fail("Reclaim succeeded without reclaim_to being set");
+        } catch (err: any) {
+            expect(err.message).to.match(/Reclaim destination not set/i);
+        }
+    })
+
+    it("Unable to reclame WithdrawIDRecord before expiration", async () => {
+        const destination = anchor.web3.Keypair.generate().publicKey;
+        const withdrawId = 777;
+        const amount = 50_000_000;
+
+        // fund vault
+        const sig = await provider.connection.requestAirdrop(
+            vault_publicKey,
+            2 * anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig);
+
+        // fund withdrawer
+        const sig2 = await provider.connection.requestAirdrop(
+            withdrawers[0].publicKey,
+            anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig2);
+
+        const expireAt = getTimestamp() + 1000;
+
+        // create WithdrawIDRecord
+        await withdrawSol(amount, destination, withdrawId, withdrawers[0], expireAt);
+
+        const withdrawIdBN = new anchor.BN(withdrawId);
+        const withdrawIdBytes = withdrawIdBN.toArrayLike(Buffer, "le", 8);
+
+        const [withdrawIdRecordPDA] = PublicKey.findProgramAddressSync(
+            [WITHDRAW_ID_SEED, withdrawIdBytes],
+            program.programId
+        );
+
+        // set reclaim_to// admin succeeds
+        await program.methods
+            .setReclaimTo(reclaimDest)
+            .accounts({
+                admin: admin.publicKey,
+            })
+            .signers([admin])
+            .rpc();
+
+        try {
+            await program.methods
+                .reclaimWithdrawId(withdrawIdBN)
+                .accounts({
+                    reclaimTo: reclaimDest,
+                    operator: operator.publicKey,
+                })
+                .signers([operator])
+                .rpc();
+
+            expect.fail("Should not reclaim before expiration");
+        } catch (err: any) {
+            expect(err.message).to.match(/Withdraw record not expired/i);
+        }
+    });
+
+    it("Only Operator can reclaim the WithdrawIDRecord lamparts", async () => {
+        const destination = anchor.web3.Keypair.generate().publicKey;
+        const withdrawId = 999;
+        const amount = 30_000_000;
+
+        // fund vault
+        const sig = await provider.connection.requestAirdrop(
+            vault_publicKey,
+            2 * anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig);
+
+        // fund withdrawer
+        const sig2 = await provider.connection.requestAirdrop(
+            withdrawers[0].publicKey,
+            anchor.web3.LAMPORTS_PER_SOL
+        );
+        await provider.connection.confirmTransaction(sig2);
+
+        const expireAt = getTimestamp() + 1;
+
+        await withdrawSol(amount, destination, withdrawId, withdrawers[0], expireAt);
+
+        // wait until expired
+        await timeout(5000);
+
+        const withdrawIdBN = new anchor.BN(withdrawId);
+        const withdrawIdBytes = withdrawIdBN.toArrayLike(Buffer, "le", 8);
+
+        const [withdrawIdRecordPDA] = PublicKey.findProgramAddressSync(
+            [WITHDRAW_ID_SEED, withdrawIdBytes],
+            program.programId
+        );
+
+        // set reclaim_to
+        // admin succeeds
+        await program.methods
+            .setReclaimTo(reclaimDest)
+            .accounts({
+                admin: admin.publicKey,
+            })
+            .signers([admin])
+            .rpc();
+
+        // non-operator fails
+        try {
+            await program.methods
+                .reclaimWithdrawId(withdrawIdBN)
+                .accounts({
+                    reclaimTo: reclaimDest,
+                    operator: withdrawers[0].publicKey,
+                })
+                .signers([withdrawers[0]])
+                .rpc();
+
+            expect.fail("Non-operator reclaimed lamports");
+        } catch (err: any) {
+            expect(err.message).to.match(/Operator restricted/i);
+        }
+
+        // check WithdrawIDRecord lamports before reclaim
+        const recordInfoBefore = await provider.connection.getAccountInfo(withdrawIdRecordPDA);
+        expect(recordInfoBefore).to.not.equal(null);
+        const recordLamportsBefore = recordInfoBefore!.lamports;
+        expect(recordLamportsBefore).to.be.greaterThan(0);
+
+        const vaultBalanceBefore = await provider.connection.getBalance(reclaimDest);
+
+        // call reclaim
+        await program.methods
+            .reclaimWithdrawId(withdrawIdBN)
+            .accounts({
+                reclaimTo: reclaimDest,
+                operator: operator.publicKey,
+            })
+            .signers([operator])
+            .rpc();
+
+        // check WithdrawIDRecord lamparts after reclaim
+        const recordInfoAfter = await provider.connection.getAccountInfo(withdrawIdRecordPDA);
+        if (recordInfoAfter === null) {
+            expect(recordInfoAfter).to.equal(null);
+        } else {
+            expect(recordInfoAfter.lamports).to.equal(0);
+        }
+
+        // Check main vault balance change after reclaim
+        const vaultBalanceAfter = await provider.connection.getBalance(reclaimDest);
+        expect(vaultBalanceAfter).to.be.greaterThan(vaultBalanceBefore);
     });
 });
