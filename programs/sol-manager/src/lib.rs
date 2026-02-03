@@ -771,8 +771,6 @@ pub struct WithdrawSol<'info> {
     #[account(address = sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
 
-    /// CHECK: PDA withdraw_id record, checked in code
-    /// init_if_needed change to init in mainnet
     #[account(
         init,
         payer = signer,
@@ -886,9 +884,8 @@ pub struct WithdrawSpl<'info> {
     #[account(address = sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
     
-    /// init_if_needed change to init in mainnet
     #[account(
-        init_if_needed,
+        init,
         payer = signer,
         space =  8 + WithdrawIDRecord::INIT_SPACE,
         seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
@@ -1039,7 +1036,7 @@ pub struct SetReclaimTo<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(withdraw_id: u64)]
+#[instruction(_withdraw_id: i64)]
 pub struct ReclaimWithdrawId<'info> {
     #[account(
         seeds = [ASSETMAN_CONFIG_SEEDS],
@@ -1049,7 +1046,7 @@ pub struct ReclaimWithdrawId<'info> {
 
     #[account(
         mut,
-        seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
+        seeds = [WITHDRAW_ID_SEED, &_withdraw_id.to_le_bytes()],
         bump,
     )]
     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
