@@ -589,18 +589,6 @@ pub struct Configs {
     pub paused: bool,
 }
 
-impl Configs {
-    pub fn is_admin(&self, user: &AccountInfo) -> Result<()> {
-        require!(self.admin == user.key(), CustomError::AdminRestricted);
-        Ok(())
-    }
-
-    pub fn is_withdrawer(&self, user: &AccountInfo) -> Result<()> {
-        require!(self.withdrawers.contains(&user.key()), CustomError::UnauthorizedWithdrawer);
-        Ok(())
-    }
-}
-
 // Define account contexts for instructions
 #[derive(Accounts)]
 pub struct Initialize<'info> {
