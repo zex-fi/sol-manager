@@ -18,7 +18,7 @@ import { expect } from "chai";
 import { keyGen, signFrost } from "./frost-utils";
 
 
-const ASSETMAN_CONFIG_SEEDS = Buffer.from("assetman-configs"); // Updated seed
+const ASSETMAN_CONFIG_SEEDS = Buffer.from("assetman-configs-v2"); // Updated seed
 const MAIN_VAULTS_SEED = Buffer.from("main-vault");
 const USER_VAULTS_SEED = Buffer.from("user-vault");
 const WITHDRAW_ID_SEED = Buffer.from("withdraw-id");
@@ -279,7 +279,7 @@ describe("zex-asset-manager", () => {
 
     it("Is initialized!", async () => {
         const tx = await program.methods
-            .initialize(oldAdmin.publicKey)
+            .initialize(frostPubkey)
             .accounts({
                 admin: oldAdmin.publicKey,
             })
@@ -292,12 +292,19 @@ describe("zex-asset-manager", () => {
 
     it("Can transfer admin", async () => {
         await program.methods
-            .transferAdmin(admin.publicKey)
+            .proposeAdmin(admin.publicKey)
             .accounts({
                 admin: oldAdmin.publicKey,
-                configs: configs_publicKey, // Initialize configs account
             })
             .signers([oldAdmin])
+            .rpc();
+
+        await program.methods
+            .acceptAdmin()
+            .accounts({
+                newAdmin: admin.publicKey,
+            })
+            .signers([admin])
             .rpc();
 
         // Fetch the list of admins and check if newAdmin was added
@@ -327,7 +334,6 @@ describe("zex-asset-manager", () => {
                 .withdrawerAdd(withdrawers[0].publicKey)
                 .accounts({
                     admin: oldAdmin.publicKey,
-                    configs: configs_publicKey,
                 })
                 .signers([oldAdmin])
                 .rpc()
@@ -343,7 +349,6 @@ describe("zex-asset-manager", () => {
             .withdrawerAdd(withdrawers[0].publicKey)
             .accounts({
                 admin: admin.publicKey,
-                configs: configs_publicKey, // Initialize configs account
             })
             .signers([admin])
             .rpc();
@@ -358,7 +363,6 @@ describe("zex-asset-manager", () => {
             .withdrawerAdd(withdrawers[1].publicKey)
             .accounts({
                 admin: admin.publicKey,
-                configs: configs_publicKey,
             })
             .signers([admin])
             .rpc();
@@ -371,7 +375,6 @@ describe("zex-asset-manager", () => {
             .withdrawerDelete(withdrawers[1].publicKey)
             .accounts({
                 admin: admin.publicKey,
-                configs: configs_publicKey,
             })
             .signers([admin])
             .rpc();
