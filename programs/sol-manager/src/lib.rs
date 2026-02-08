@@ -25,6 +25,8 @@ use anchor_lang::solana_program::sysvar::{
     self,
     instructions::{load_current_index_checked, load_instruction_at_checked}
 };
+use anchor_lang::solana_program::clock::Clock;
+
 use bs58;
 
 /*
@@ -46,7 +48,7 @@ const MAIN_VAULTS_SEED: &[u8] = b"main-vault";
 const USER_VAULTS_SEED: &[u8] = b"user-vault";
 
 /// Replay protection PDA for withdrawals
-const WITHDRAW_ID_SEED: &[u8] = b"withdraw-id";
+const WITHDRAW_ID_SEED: &[u8] = b"withdraw-id-v2";
 
 /// Maximum number of authorized withdrawers
 const MAX_WITHDRAWER_LEN: usize = 10;
@@ -61,11 +63,11 @@ declare_id!("YHXAM22ivWgtn3qk4bmX64dREsZbRp6gYd6MfqFPjG5");
     Any formatting mismatch invalidates signatures.
     ============================================================
 */
-fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, withdraw_id: u64) -> Vec<u8> {
+fn get_withdraw_message(token: &str, public_key: &Pubkey, amount: u64, withdraw_id: u64, expires_at: i64) -> Vec<u8> {
     let base58_address = bs58::encode(public_key.to_bytes()).into_string();
     let formatted_string = format!(
-        "allowed withdraw {} {} to address {} with withdraw_id {}",
-        amount, token, base58_address, withdraw_id
+        "allowed withdraw {} {} to address {} with withdraw_id {} expire at: {}",
+        amount, token, base58_address, withdraw_id, expires_at
     );
     formatted_string.as_bytes().to_vec()
 }
@@ -91,6 +93,8 @@ pub mod zex_asset_manager {
         let configs = &mut ctx.accounts.configs;
         configs.admin = ctx.accounts.admin.key();
         configs.pending_admin = None;
+        configs.operator = ctx.accounts.admin.key();
+        configs.reclaim_to = None;
         configs.paused = false;
 
         require!(frost_pubkey != Pubkey::default(), CustomError::MissingData);
@@ -212,6 +216,16 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
+    pub fn update_operator(
+        ctx: Context<UpdateOperator>,
+        new_operator: Pubkey,
+    ) -> Result<()> {
+        require!(new_operator != Pubkey::default(), CustomError::MissingData);
+
+        ctx.accounts.configs.operator = new_operator;
+        Ok(())
+    }
+    
     /*
         ------------------------------------------------------------
         withdrawer_add
@@ -319,6 +333,7 @@ pub mod zex_asset_manager {
         amount: u64,
         withdraw_id: u64,
         signature: [u8; 64],
+        expires_at: i64,
     ) -> Result<()> {
         let assetman = &ctx.accounts.configs;
 
@@ -327,15 +342,20 @@ pub mod zex_asset_manager {
         require!(index >= 1, CustomError::VerifyFirst);
 
         // Verify signature (message includes withdraw_id)
-        let message = get_withdraw_message("SOL", &ctx.accounts.destination.key(), amount, withdraw_id);
+        let message = get_withdraw_message("SOL", &ctx.accounts.destination.key(), amount, withdraw_id, expires_at);
         let ix = load_instruction_at_checked(index as usize - 1, &ctx.accounts.instructions.to_account_info())?;
         ed25519::verify(&ix, &signature, &message, &assetman.frost_pubkey.to_bytes())?;
+
+        // Check signature expiration time
+        let now = Clock::get()?.unix_timestamp;
+        require!(now <= expires_at, CustomError::SignatureExpired);
 
         // Check if withdraw_id already used
         require!(!ctx.accounts.withdraw_id_record.used, CustomError::Unauthorized);
 
         // Mark withdraw_id as used
         ctx.accounts.withdraw_id_record.used = true;
+        ctx.accounts.withdraw_id_record.expires_at = expires_at;
 
         // Transfer SOL (rent-aware)
         let vault = &ctx.accounts.main_vault;
@@ -394,6 +414,7 @@ pub mod zex_asset_manager {
         amount: u64,
         withdraw_id: u64,
         signature: [u8; 64],
+        expires_at: i64,
     ) -> Result<()> {
         let assetman = &ctx.accounts.configs;
 
@@ -407,15 +428,21 @@ pub mod zex_asset_manager {
             &ctx.accounts.destination.key(),
             amount,
             withdraw_id,
+            expires_at
         );
 
         // Load prior ed25519 instruction
         let ix = load_instruction_at_checked(index as usize - 1, &ctx.accounts.instructions.to_account_info())?;
         ed25519::verify(&ix, &signature, &message, &assetman.frost_pubkey.to_bytes())?;
 
+        // Check signature expiration time
+        let now = Clock::get()?.unix_timestamp;
+        require!(now <= expires_at, CustomError::SignatureExpired);
+
         // withdraw_id check
         require!(!ctx.accounts.withdraw_id_record.used, CustomError::Unauthorized);
         ctx.accounts.withdraw_id_record.used = true;
+        ctx.accounts.withdraw_id_record.expires_at = expires_at;
 
         // Token transfer pre-checks
         ctx.accounts.ensure_sufficient_balance(amount)?;
@@ -512,15 +539,30 @@ pub mod zex_asset_manager {
         Ok(())
     }
 
-    // todo :: this is for development phase remove for mainnet
-    // it is`nt possible to do it bulk in program because you need to pass them in context
-    
-    // pub fn reset_withdraw_sol_id(
-    //     ctx: Context<ResetWithdrawSolId>,
-    // ) -> Result<()> {
-    //     ctx.accounts.withdraw_id_record.used = false;
-    //     Ok(())
-    // }
+    pub fn set_reclaim_to(
+        ctx: Context<SetReclaimTo>,
+        reclaim_to: Option<Pubkey>,
+    ) -> Result<()> {
+        ctx.accounts.configs.reclaim_to = reclaim_to;
+        Ok(())
+    }
+
+    pub fn reclaim_withdraw_id(
+        ctx: Context<ReclaimWithdrawId>,
+        _withdraw_id: i64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let record = &ctx.accounts.withdraw_id_record;
+
+        require!(now > record.expires_at, CustomError::NotExpired);
+
+        let lamports = **ctx.accounts.withdraw_id_record.to_account_info().lamports.borrow();
+
+        **ctx.accounts.withdraw_id_record.to_account_info().lamports.borrow_mut() = 0;
+        **ctx.accounts.reclaim_to.lamports.borrow_mut() += lamports;
+
+        Ok(())
+    }
 }
 
 // Define the legacy Configs account
@@ -539,22 +581,12 @@ pub struct ConfigsV1 {
 pub struct Configs {
     pub admin: Pubkey,
     pub pending_admin: Option<Pubkey>,
+    pub operator: Pubkey,
+    pub reclaim_to: Option<Pubkey>, 
     #[max_len(MAX_WITHDRAWER_LEN)]
     pub withdrawers: Vec<Pubkey>,
     pub frost_pubkey: Pubkey,
     pub paused: bool,
-}
-
-impl Configs {
-    pub fn is_admin(&self, user: &AccountInfo) -> Result<()> {
-        require!(self.admin == user.key(), CustomError::AdminRestricted);
-        Ok(())
-    }
-
-    pub fn is_withdrawer(&self, user: &AccountInfo) -> Result<()> {
-        require!(self.withdrawers.contains(&user.key()), CustomError::UnauthorizedWithdrawer);
-        Ok(())
-    }
 }
 
 // Define account contexts for instructions
@@ -644,6 +676,19 @@ pub struct CancelAdminProposal<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateOperator<'info> {
+    #[account(
+        mut,
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump,
+        constraint = configs.admin == admin.key() @ CustomError::AdminRestricted
+    )]
+    pub configs: Account<'info, Configs>,
+
+    pub admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct WithdrawerAdd<'info> {
     #[account(
         mut,
@@ -714,12 +759,10 @@ pub struct WithdrawSol<'info> {
     #[account(address = sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
 
-    /// CHECK: PDA withdraw_id record, checked in code
-    /// init_if_needed change to init in mainnet
     #[account(
         init,
         payer = signer,
-        space = 8 + 1,
+        space = 8 + WithdrawIDRecord::INIT_SPACE,
         seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
         bump,
     )]
@@ -829,11 +872,10 @@ pub struct WithdrawSpl<'info> {
     #[account(address = sysvar::instructions::ID)]
     pub instructions: UncheckedAccount<'info>,
     
-    /// init_if_needed change to init in mainnet
     #[account(
-        init_if_needed,
+        init,
         payer = signer,
-        space =  8 + 1,
+        space =  8 + WithdrawIDRecord::INIT_SPACE,
         seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
         bump,
     )]
@@ -867,9 +909,10 @@ impl<'info> WithdrawSpl<'info> {
 }
 
 #[account]
-#[derive(Default)]
+#[derive(Default, InitSpace)]
 pub struct WithdrawIDRecord {
     pub used: bool,
+    pub expires_at: i64, // unix timestamp (seconds)
 }
 
 #[derive(Accounts)]
@@ -963,21 +1006,57 @@ pub struct EmergencyWithdraw {
     pub destination: Pubkey,
 }
 
-// #[derive(Accounts)]
-// #[instruction(withdraw_id: u64)]
-// pub struct ResetWithdrawSolId<'info> {
-//     #[account(mut)]
-//     pub admin: Signer<'info>,
+#[derive(Accounts)]
+pub struct SetReclaimTo<'info> {
+    #[account(
+        mut,
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump
+    )]
+    pub configs: Account<'info, Configs>,
 
-//     #[account(
-//         mut,
-//         seeds = [WITHDRAW_ID_SEED, &withdraw_id.to_le_bytes()],
-//         bump,
-//     )]
-//     pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
+    #[account(
+        signer,
+        constraint = configs.admin == admin.key()
+            @ CustomError::AdminRestricted
+    )]
+    pub admin: AccountInfo<'info>,
+}
 
-//     pub system_program: Program<'info, System>,
-// }
+#[derive(Accounts)]
+#[instruction(_withdraw_id: i64)]
+pub struct ReclaimWithdrawId<'info> {
+    #[account(
+        seeds = [ASSETMAN_CONFIG_SEEDS],
+        bump
+    )]
+    pub configs: Account<'info, Configs>,
+
+    #[account(
+        mut,
+        seeds = [WITHDRAW_ID_SEED, &_withdraw_id.to_le_bytes()],
+        bump,
+    )]
+    pub withdraw_id_record: Account<'info, WithdrawIDRecord>,
+
+    #[account(
+        mut,
+        constraint = configs
+            .reclaim_to
+            .ok_or(CustomError::MissingReclaimDest)?
+            == reclaim_to.key()
+    )]
+    pub reclaim_to: SystemAccount<'info>,
+
+    #[account(
+        signer,
+        constraint = configs.operator == operator.key()
+            @ CustomError::OperatorRestricted
+    )]
+    pub operator: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
+}
 
 
 // Define custom errors
@@ -985,6 +1064,8 @@ pub struct EmergencyWithdraw {
 pub enum CustomError {
     #[msg("Admin restricted method")]
     AdminRestricted,
+    #[msg("Operator restricted method")]
+    OperatorRestricted,
     #[msg("No pending admin to accept")]
     NoPendingAdmin,
     #[msg("Unauthorized withdrawer")]
@@ -1007,4 +1088,10 @@ pub enum CustomError {
     MintMismatch,
     #[msg("Program is paused")]
     ProgramPaused,
+    #[msg("Signature expired")]
+    SignatureExpired,
+    #[msg("Withdraw record not expired")]
+    NotExpired,
+    #[msg("Reclaim destination not set")]
+    MissingReclaimDest,
 }
